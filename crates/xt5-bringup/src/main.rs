@@ -47,6 +47,7 @@ struct Args {
     trace: Option<PathBuf>,
     trace_limit: usize,
     trace_after_ms: u64,
+    watch_ranges: Vec<(u64, u64)>,
     set_regs: Vec<(Option<usize>, String, u64)>,
     watch: Vec<u64>,
     pokes: Vec<(u64, u32)>,
@@ -88,6 +89,7 @@ fn args() -> Result<Args, String> {
         trace: None,
         trace_limit: 200_000,
         trace_after_ms: 0,
+        watch_ranges: vec![],
         set_regs: vec![],
         watch: vec![],
         pokes: vec![],
@@ -204,6 +206,12 @@ fn args() -> Result<Args, String> {
             "--trace" => out.trace = Some(value()?.into()),
             "--trace-limit" => out.trace_limit = parse_u64(&value()?)? as usize,
             "--trace-after" => out.trace_after_ms = parse_u64(&value()?)?,
+            "--watch-range" => {
+                for item in value()?.split(',') {
+                    let (lo, hi) = item.split_once('-').ok_or("--watch-range LO-HI[,LO-HI]")?;
+                    out.watch_ranges.push((parse_u64(lo)?, parse_u64(hi)?));
+                }
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -224,7 +232,7 @@ fn snapshot(board: &fujimod_emulator::board::Board, core: usize) -> Value {
         "x19": r(Register::X(19)), "x20": r(Register::X(20)), "x21": r(Register::X(21)),
         "x30": r(Register::X(30)),
     });
-    for name in ["VBAR_EL1", "SCTLR_EL1", "SP_EL0", "SP_EL1", "ELR_EL1", "ESR_EL1", "FAR_EL1"] {
+    for name in ["VBAR_EL1", "SCTLR_EL1", "SP_EL0", "SP_EL1", "ELR_EL1", "ESR_EL1", "FAR_EL1", "CNTV_CTL_EL0", "CNTV_CVAL_EL0", "0xdf11", "0xdf12", "ICC_PMR_EL1", "ICC_IGRPEN1_EL1", "TPIDR_EL1"] {
         v[name] = json!(r(sysreg(name)));
     }
     v
@@ -580,8 +588,11 @@ fn run() -> Result<(), String> {
         w.dedup();
         board.watch_pcs(&w)?;
     }
+    if !args.watch_ranges.is_empty() {
+        board.transaction_watch_begin(args.watch_ranges.clone(), args.trace_limit)?;
+    }
     let mut tracing = false;
-    if args.trace.is_some() && args.trace_after_ms == 0 {
+    if args.trace.is_some() && args.trace_after_ms == 0 && args.watch_ranges.is_empty() {
         board.observe_transactions(Some(args.trace_limit));
         tracing = true;
     }
@@ -600,7 +611,7 @@ fn run() -> Result<(), String> {
             break;
         }
         ran += step;
-        if !tracing && args.trace.is_some() && board.now() >= args.trace_after_ms * 1_000_000 {
+        if !tracing && args.watch_ranges.is_empty() && args.trace.is_some() && board.now() >= args.trace_after_ms * 1_000_000 {
             board.observe_transactions(Some(args.trace_limit));
             tracing = true;
             eprintln!("tracing from t={}", board.now());
@@ -697,7 +708,20 @@ fn run() -> Result<(), String> {
         }
     }
     eprintln!("frames per output: {frame_count:?}");
-    if let Some(path) = &args.trace {
+    if let Ok(kinds) = std::env::var("XT5_DEVICE_STATES") {
+        for kind in kinds.split(',') {
+            eprintln!("device {kind}: {}", serde_json::to_string(&board.device_states(kind)?).unwrap());
+        }
+    }
+    if let Ok(path) = std::env::var("XT5_GIC_OUT") {
+        std::fs::write(&path, serde_json::to_string_pretty(&board.gic_state()?).unwrap()).map_err(|e| e.to_string())?;
+    }
+    if !args.watch_ranges.is_empty() {
+        let batch = board.transaction_watch_end()?;
+        let path = args.trace.clone().unwrap_or_else(|| "watch.json".into());
+        std::fs::write(&path, serde_json::to_string(&batch).unwrap()).map_err(|e| e.to_string())?;
+        eprintln!("watch: {} transactions, {} omitted -> {}", batch.transactions.len(), batch.omitted, path.display());
+    } else if let Some(path) = &args.trace {
         std::fs::write(path, serde_json::to_string(&board.transactions()).unwrap())
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
