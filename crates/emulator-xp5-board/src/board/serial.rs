@@ -25,6 +25,40 @@ enum Part {
     SerialCalibrationRegisters { miso_high: bool },
     BisConfigurationRegisters { revision: [u8; 2], idle_high: bool },
     Lsm6dsConfigurationRegisters,
+    /// xt5-bringup: an unidentified chip. Accepts every frame, records the
+    /// last words written and answers with a fixed MISO level.
+    GenericSink { miso_high: bool },
+}
+/// xt5-bringup: endpoint for bring-up of bodies whose serial parts are not yet identified.
+struct GenericSink {
+    miso_high: bool,
+    transfers: u64,
+    last: Vec<u16>,
+}
+impl Endpoint for GenericSink {
+    fn name(&self) -> &'static str {
+        "generic-sink"
+    }
+    fn validate(&self, _: fujimod_emulator_parts_io::serial::Frame) -> Result<(), String> {
+        Ok(())
+    }
+    fn reset_transaction(&mut self) {}
+    fn transfer(&mut self, frame: fujimod_emulator_parts_io::serial::Frame, _: u64) -> u16 {
+        self.transfers += 1;
+        self.last.push(frame.word);
+        if self.last.len() > 16 {
+            self.last.remove(0);
+        }
+        if self.miso_high { u16::MAX } else { 0 }
+    }
+    fn save(&self) -> serde_json::Value {
+        serde_json::json!({"miso_high": self.miso_high, "transfers": self.transfers, "last": self.last})
+    }
+    fn restore(&mut self, state: &serde_json::Value) -> Result<(), String> {
+        self.transfers = state["transfers"].as_u64().unwrap_or(0);
+        self.last = state["last"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64().map(|v| v as u16)).collect()).unwrap_or_default();
+        Ok(())
+    }
 }
 /// A power controller whose key-ladder registers are driven by the body's
 /// controls. Their value is refreshed before every transfer, so the guest reads
@@ -120,6 +154,7 @@ fn endpoint(part: Part, controls: Option<Arc<dyn Controls>>) -> Result<Box<dyn E
         Part::Lsm6dsConfigurationRegisters => {
             Box::new(fujimod_emulator_parts_io::lsm6ds::Registers::default())
         }
+        Part::GenericSink { miso_high } => Box::new(GenericSink { miso_high, transfers: 0, last: vec![] }),
     })
 }
 fn attachments(
