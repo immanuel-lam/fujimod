@@ -11,6 +11,16 @@
 //!     --wake-secondaries-at 1800 --quantum 100 --instructions 9000000000 --chunk 100000000 \
 //!     --stub 0xfaf07000:0x780=constant:1,0x784=constant:0,0x800=constant:1 --no-stop \
 //!     --frames-dir DIR --all-frames
+//! Slot-1 card for the handoff start (host SDHCI at 0xff9b0000, firmware
+//! interrupt table id 0x84 = INTID 262; the second register set at
+//! 0xff9b2200 reports no UHS-II so the standard path is taken):
+//!   --card 0xff9b0000@262=card.img --card 0xff9b2200/0x1e0=card.img \
+//!   --stub 0xff9b2000/0x200:0x7c=constant:1
+//! where card.img is a raw MBR/FAT32 image (diskutil partitionDisk on an
+//! attached sparse file). The OS enumerates the card and reads/writes it;
+//! with a card present the REC task then starts live view and polls the
+//! imaging-sensor block (0xff948284..0xff9482d8) without finishing, so the
+//! shooting screen is not drawn yet (black frames after 9.3 s).
 //! The card's ffboot.bin needs two emulator-only NOPs (stage1 0x2178 and
 //! 0x2190: ICC_SRE_EL2 / ICC_IGRPEN1_EL3, which the CPU backend lacks), see
 //! tools/xt5_card_emu_patch.py. --quantum 100 avoids the image-4 four-core
