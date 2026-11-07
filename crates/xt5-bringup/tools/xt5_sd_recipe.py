@@ -23,7 +23,8 @@ Not located for the X-T5 (conservative choices, see `missing`):
   status lamp      X-M5 1.30 values are copied; unverified on the X-T5 body
   SD pad routing   no operations emitted; the real card read would fail safely
   updater          not located; `build` (recovery card with DAT) refuses
-  p3 / p6          no fixed DRAM address in the table; not preloaded
+  p3               no fixed DRAM address; the M4 payload is not preloaded
+  p6               overlays placed at DRAM 0x4e70000 as observed in the flash boot
 """
 import hashlib
 import json
@@ -38,6 +39,7 @@ PT_FLASH = 0x1A0000
 PT_DRAM = 0x10C0000
 STAGE1_FLASH, STAGE1_SIZE = 0x28000, 0x14000
 SELECTOR = 0x11A00
+OVERLAYS_DRAM = 0x4E70000
 
 sys.path.insert(0, os.path.expanduser('~/xt5work/tools'))
 import fwpatch  # noqa: E402  (the user's LZ tokenizer; same stream format as fujimod method4)
@@ -87,6 +89,10 @@ def main():
     ]
     bss = []
     for pid, p in sorted(partitions(flash).items()):
+        if pid == 6 and p['dram'] == 0 and p['size']:
+            # Overlays: no table address; the flash-boot emulator run places the
+            # decoded image at DRAM 0x4e70000 (observed, not located in code).
+            p = p | {'dram': OVERLAYS_DRAM, 'zero_size': 0}
         if p['dram'] == 0 or p['size'] == 0:
             continue
         if p['flags'] & 1:
@@ -141,7 +147,8 @@ def main():
             'version-independent stock updater acceptance',
             'X-T5 status-lamp GPIO binding unverified (X-M5 1.30 values copied)',
             'X-T5 SD pad routing operations not located (none emitted)',
-            'partitions 3 and 6 have no fixed DRAM address and are not preloaded',
+            'partition 3 (M4 payload) has no fixed DRAM address and is not preloaded',
+            'partition 6 address 0x4e70000 observed in the emulator flash boot, not located in code',
         ],
     )
     if write:
