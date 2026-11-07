@@ -4,6 +4,18 @@
 //! description with the X-T5 body and runs the stock update's first-stage
 //! loader, standing in for the boot ROM (which we do not have): it copies the
 //! loader from flash into boot SRAM and starts core 0 at its entry.
+//!
+//! SD-card start (fujimod-recovery XP5 startup card):
+//!   xt5-bringup --update FWUP0030.DAT --start sdcard --sd-dir CARD_DIR \
+//!     --secondaries --set 1:pc=0xf0027190 --set 2:pc=0xf0027190 --set 3:pc=0xf0027190 \
+//!     --wake-secondaries-at 1800 --quantum 100 --instructions 9000000000 --chunk 100000000 \
+//!     --stub 0xfaf07000:0x780=constant:1,0x784=constant:0,0x800=constant:1 --no-stop \
+//!     --frames-dir DIR --all-frames
+//! The card's ffboot.bin needs two emulator-only NOPs (stage1 0x2178 and
+//! 0x2190: ICC_SRE_EL2 / ICC_IGRPEN1_EL3, which the CPU backend lacks), see
+//! tools/xt5_card_emu_patch.py. --quantum 100 avoids the image-4 four-core
+//! barrier race (docs/STATUS.md "Barrier race"). The wizard's language page
+//! appears at about 3.9 s guest time (1.9 s of that is the card load).
 
 use fujimod_catalog_resolution::ResolvedConfiguration;
 use fujimod_emulator::board::{bus::Mode, factory};
