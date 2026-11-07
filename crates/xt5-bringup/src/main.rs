@@ -78,8 +78,11 @@ struct Args {
     /// Skip the bring-up register stubs that let the stock setup run from SRAM.
     no_stubs: bool,
     /// Extra stub windows: (base, registers as bringup_stub JSON).
-    stubs: Vec<(u64, Vec<Value>)>,
+    stubs: Vec<(u64, u64, Vec<Value>)>,
     wake_ms: Option<u64>,
+    /// `--card BASE=IMAGE`: a raw host card image (MBR/FAT32 or exFAT) attached
+    /// to an SDHCI host at BASE for any start mode.
+    cards: Vec<(u64, u64, Option<u64>, PathBuf)>,
 }
 
 fn parse_u64(text: &str) -> Result<u64, String> {
@@ -127,6 +130,7 @@ fn args() -> Result<Args, String> {
         no_stubs: false,
         stubs: vec![],
         wake_ms: None,
+        cards: vec![],
     };
     let mut it = std::env::args().skip(1);
     while let Some(key) = it.next() {
@@ -152,6 +156,20 @@ fn args() -> Result<Args, String> {
             }
             "--start" => out.start = value()?,
             "--sd-dir" => out.sd_dir = Some(value()?.into()),
+            "--card" => {
+                let v = value()?;
+                // BASE[/SIZE][@IRQ]=IMAGE; IRQ is the GIC line the host raises.
+                let (base, path) = v.split_once('=').ok_or("--card BASE[/SIZE][@IRQ]=IMAGE")?;
+                let (base, irq) = match base.split_once('@') {
+                    Some((b, i)) => (b, Some(parse_u64(i)?)),
+                    None => (base, None),
+                };
+                let (base, size) = match base.split_once('/') {
+                    Some((b, s)) => (b, parse_u64(s)?),
+                    None => (base, 0x1000),
+                };
+                out.cards.push((parse_u64(base)?, size, irq, path.into()));
+            }
             "--no-stubs" => out.no_stubs = true,
             // Wake cores 1-3 at guest time MS (SD start: the secondaries park
             // in the stock flash loop until the emulator wakes them).
@@ -159,14 +177,18 @@ fn args() -> Result<Args, String> {
             "--stub" => {
                 // BASE:OFFSET=MODE[:VALUE][,OFFSET=MODE[:VALUE]...]; MODE as in bringup_stub::Mode.
                 let v = value()?;
-                let (base, list) = v.split_once(':').ok_or("--stub BASE:OFFSET=MODE[:VALUE],...")?;
+                let (base, list) = v.split_once(':').ok_or("--stub BASE[/SIZE]:OFFSET=MODE[:VALUE],...")?;
+                let (base, size) = match base.split_once('/') {
+                    Some((b, s)) => (b, parse_u64(s)?),
+                    None => (base, 0x1000),
+                };
                 let mut registers = vec![];
                 for item in list.split(',') {
                     let (offset, spec) = item.split_once('=').ok_or("--stub OFFSET=MODE[:VALUE]")?;
                     let (mode, val) = spec.split_once(':').unwrap_or((spec, "0"));
                     registers.push(json!({"offset": parse_u64(offset)?, "mode": mode, "value": parse_u64(val)?}));
                 }
-                out.stubs.push((parse_u64(base)?, registers));
+                out.stubs.push((parse_u64(base)?, size, registers));
             }
             "--image" => {
                 let v = value()?;
@@ -615,16 +637,20 @@ fn run() -> Result<(), String> {
                 json!({"offset": 0x800, "mode": "constant", "value": 1}),
             ])?);
         }
-        for (base, registers) in &args.stubs {
-            windows.retain(|w| w.base != *base);
-            windows.push(stub(*base, registers.clone())?);
-        }
         if let Some(ms) = args.wake_ms {
             let options = toml::Value::try_from(json!({"registers": [], "wake_tick": ms * 1_000_000, "wake_cores": [1, 2, 3]}))
                 .map_err(|e| e.to_string())?;
             let toml::Value::Table(options) = options else { return Err("wake options".into()) };
             windows.push(fujimod_emulator_devices::graph::DeviceWindow { base: 0xfaf4_7000, size: 0x1000, kind: "bringup-stub".into(), options });
         }
+    }
+    // Caller stubs apply to every start mode (for example the SD host vendor
+    // block 0xff9b2000, whose +0x22c the OS polls after writing 1).
+    for (base, size, registers) in &args.stubs {
+        let options = toml::Value::try_from(json!({ "registers": registers })).map_err(|e| e.to_string())?;
+        let toml::Value::Table(options) = options else { return Err("stub options".into()) };
+        windows.retain(|w| w.base != *base);
+        windows.push(fujimod_emulator_devices::graph::DeviceWindow { base: *base, size: *size, kind: "bringup-stub".into(), options });
     }
     // SD host for the card start. The XP5 catalog declares no SD controller;
     // the base is fujimod-recovery's XP5 `board.host` (0xff9b0000). The
@@ -672,6 +698,36 @@ fn run() -> Result<(), String> {
             protected: false,
         };
         sd_media = xp5_board::sd::resolve(vec![inputs], &assets)?;
+    }
+    // Host card images: only the non-zero sectors are loaded into the sparse
+    // card part. Each image gets its own SDHCI host window; the base is the
+    // caller's (trace the OS to find the slot's host).
+    for (index, (base, size, irq, path)) in args.cards.iter().enumerate() {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if bytes.len() % 512 != 0 { return Err(format!("{}: not a whole number of sectors", path.display())); }
+        let sectors = u32::try_from(bytes.len() / 512).map_err(|_| "card image too large")?;
+        let mut card = fujimod_emulator_devices::parts::sd_card::Card::new(
+            fujimod_emulator_devices::parts::sd_card::Options { sectors, max_dirty_sectors: 0x10_0000 },
+        )?;
+        let mut loaded = 0u64;
+        for (lba, sector) in bytes.chunks_exact(512).enumerate() {
+            if sector.iter().any(|b| *b != 0) {
+                card.write_bytes(lba as u64 * 512, sector)?;
+                loaded += 1;
+            }
+        }
+        eprintln!("card {}: {} sectors, {loaded} non-zero, host {base:#x}", path.display(), sectors);
+        let options = toml::Value::try_from(json!({"controller": {
+            "base": base, "protocol": "sdhc", "transfer_ticks": 4, "clock_ticks": 2, "rca": 1,
+            "ram_bytes": DRAM_LIMIT, "high_speed": false,
+        }, "irq": irq.unwrap_or(500 + index as u64)})).map_err(|e| e.to_string())?;
+        let toml::Value::Table(options) = options else { return Err("sdhci options".into()) };
+        windows.retain(|w| w.base != *base);
+        windows.push(fujimod_emulator_devices::graph::DeviceWindow { base: *base, size: *size, kind: "sdhci".into(), options });
+        sd_media.insert(*base, xp5_board::sd::Media {
+            card,
+            contacts: fujimod_emulator_devices::parts::card_contacts::Contacts::new(true, false),
+        });
     }
     let mut displays = BTreeMap::new();
     for w in windows.iter().filter(|w| w.kind == "display") {

@@ -199,7 +199,10 @@ impl SdHost {
         contacts: Contacts,
         irq: Option<InterruptLine>,
     ) -> Result<Self, String> {
-        if options.base & 0xfff != 0
+        // xt5-bringup: the X-T5 slot hosts keep a second SDHCI register set at
+        // +0x200 of their vendor page (0xff9b2200), so only word alignment is
+        // required here; the window size still bounds the decode.
+        if options.base & 0x3 != 0
             || options.base > 0xffffe000
             || options.transfer_ticks == 0
             || options.rca == 0
@@ -1175,7 +1178,11 @@ impl SdHost {
             // (UHS-II) are SDHCI 4 UHS-II selections; GFX 50R 0xcac788 probes
             // them. A default-speed card has no UHS-II lanes, so they select
             // nothing; other UHS modes and tuning still refuse.
-            || offset == 0x3e && value & !0x100 != 0 && value & !0x107 != 0
+            // xt5-bringup: bit 12 (Host Version 4 Enable) is written by the
+            // X-T5 slot driver (0x1100); stored with no effect on the decode.
+            // ... and bits 4-5 (driver strength select, 0x30 after CMD6),
+            // which select nothing on the modeled lanes.
+            || offset == 0x3e && value & !0x1130 != 0 && value & !0x1137 != 0
             || offset == 0x3e && value & 7 != 0 && value & 7 != 7
             || offset == 0x100 && value & !7 != 0
             || offset == 0x104 && value != 0
