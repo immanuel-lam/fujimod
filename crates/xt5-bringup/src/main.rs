@@ -61,6 +61,12 @@ struct Args {
     save_snapshot: Option<PathBuf>,
     load_snapshot: Option<PathBuf>,
     dump_files: Vec<(u64, usize, PathBuf)>,
+    /// `--start sdcard`: directory holding the SD card files (marble_init.bin, ffboot.bin, ...).
+    sd_dir: Option<PathBuf>,
+    /// Skip the bring-up register stubs that let the stock setup run from SRAM.
+    no_stubs: bool,
+    /// Extra stub windows: (base, registers as bringup_stub JSON).
+    stubs: Vec<(u64, Vec<Value>)>,
 }
 
 fn parse_u64(text: &str) -> Result<u64, String> {
@@ -104,6 +110,9 @@ fn args() -> Result<Args, String> {
         save_snapshot: None,
         load_snapshot: None,
         dump_files: vec![],
+        sd_dir: None,
+        no_stubs: false,
+        stubs: vec![],
     };
     let mut it = std::env::args().skip(1);
     while let Some(key) = it.next() {
@@ -128,6 +137,20 @@ fn args() -> Result<Args, String> {
                 }
             }
             "--start" => out.start = value()?,
+            "--sd-dir" => out.sd_dir = Some(value()?.into()),
+            "--no-stubs" => out.no_stubs = true,
+            "--stub" => {
+                // BASE:OFFSET=MODE[:VALUE][,OFFSET=MODE[:VALUE]...]; MODE as in bringup_stub::Mode.
+                let v = value()?;
+                let (base, list) = v.split_once(':').ok_or("--stub BASE:OFFSET=MODE[:VALUE],...")?;
+                let mut registers = vec![];
+                for item in list.split(',') {
+                    let (offset, spec) = item.split_once('=').ok_or("--stub OFFSET=MODE[:VALUE]")?;
+                    let (mode, val) = spec.split_once(':').unwrap_or((spec, "0"));
+                    registers.push(json!({"offset": parse_u64(offset)?, "mode": mode, "value": parse_u64(val)?}));
+                }
+                out.stubs.push((parse_u64(base)?, registers));
+            }
             "--image" => {
                 let v = value()?;
                 let (addr, path) = v.split_once('=').ok_or("--image ADDR=FILE")?;
@@ -292,7 +315,12 @@ fn run() -> Result<(), String> {
                 registers: p.registers.clone(),
             })
             .collect(),
-        "stage0" => startup
+        // stage0: the boot ROM copies the setup code (flash 0x800.., header
+        // word 0x10 bytes) to SRAM base and enters at byte 0; the setup's
+        // absolute data pointers only resolve with the code at the base.
+        // sdcard: the ROM loads marble_init.bin at the same base and enters
+        // at byte 0 (fujimod-recovery's XP5 card contract).
+        "stage0" | "sdcard" => startup
             .processors
             .iter()
             .enumerate()
@@ -307,9 +335,16 @@ fn run() -> Result<(), String> {
                     processor_id: p.processor_id.clone(),
                     released: index == 0 || args.secondaries,
                     registers: vec![
-                        (Register::Pc, BOOT_SRAM + 0x800),
-                        // EL1h, DAIF masked.
-                        (Register::Pstate, 0x3c5),
+                        (Register::Pc, BOOT_SRAM),
+                        // EL3h, DAIF masked: the ROM enters the setup at EL3
+                        // (stage1 programs SCR_EL3/ICC_SRE_EL3; the card loader
+                        // parks any core that is not at EL3).
+                        (Register::Pstate, 0x3cd),
+                        // The ROM enters with its own stack; the card loader
+                        // pushes onto it before the stock setup sets sp. Use
+                        // the top of the boot SRAM workspace (set after the
+                        // mode so it lands in SP_EL3).
+                        (Register::Sp, BOOT_SRAM + 0x3c000),
                         (sysreg("MPIDR_EL1"), mpidr),
                     ],
                 }
@@ -322,6 +357,7 @@ fn run() -> Result<(), String> {
         let register = match reg.as_str() {
             "pc" | "PC" => Register::Pc,
             "pstate" | "PSTATE" => Register::Pstate,
+            "sp" | "SP" => Register::Sp,
             r if r.starts_with('x') => Register::X(r[1..].parse().map_err(|_| format!("bad register {r}"))?),
             r => sysreg(r),
         };
@@ -345,6 +381,15 @@ fn run() -> Result<(), String> {
     const FLASH_BASE: u64 = 0xf000_0000;
     const FLASH_SIZE: usize = 0x0800_0000;
     graph.ram.push(factory::Ram { base: FLASH_BASE, size: FLASH_SIZE });
+    // DDR PHY register/firmware space (two PHYs at 0xfb000000 and
+    // 0xfb400000): the stock setup writes 16-bit PHY registers and DMA-copies
+    // the PHY IMEM/DMEM firmware to 0xfb0a0000/0xfb4a0000. Back it with RAM
+    // up to the mailbox pages at +0x1a0000, which stay bring-up stub windows.
+    if matches!(args.start.as_str(), "stage0" | "sdcard") {
+        for base in [0xfb00_0000u64, 0xfb40_0000] {
+            graph.ram.push(factory::Ram { base, size: 0x1a_0000 });
+        }
+    }
     graph.peripherals.retain(|p| !(p.core < 4 && p.address < DRAM_LIMIT));
     graph.peripherals.retain(|p| !(p.address < FLASH_BASE + FLASH_SIZE as u64 && FLASH_BASE < p.address + p.size as u64));
     // The XP5 catalog declares no A53 memory map; identity-map DRAM and boot SRAM.
@@ -517,13 +562,94 @@ fn run() -> Result<(), String> {
             }
         }
     }
+    // Bring-up stubs for blocks the stock setup polls and the catalog does not
+    // model. Each one answers a register with a scripted value; the real
+    // hardware behaviour behind them is unknown (see bringup_stub.rs).
+    if matches!(args.start.as_str(), "stage0" | "sdcard") && !args.no_stubs {
+        let stub = |base: u64, registers: Vec<Value>| -> Result<fujimod_emulator_devices::graph::DeviceWindow, String> {
+            let options = toml::Value::try_from(json!({ "registers": registers })).map_err(|e| e.to_string())?;
+            let toml::Value::Table(options) = options else { return Err("stub options".into()) };
+            Ok(fujimod_emulator_devices::graph::DeviceWindow { base, size: 0x1000, kind: "bringup-stub".into(), options })
+        };
+        // DDR PHY mailbox (stage0 0xff80e138): status +0x08 bit0 must read 0,
+        // then 1 after the +0x62 acknowledge; message +0x64 == 7 ends training.
+        for base in [0xfb1a_0000u64, 0xfb5a_0000] {
+            windows.push(stub(base, vec![
+                json!({"offset": 0x08, "mode": "toggle", "value": 1}),
+                json!({"offset": 0x64, "mode": "constant", "value": 7}),
+            ])?);
+        }
+        // stage0 0xff80135c: 0xfaf07780 must read non-zero after 0xfaf07680 is
+        // written; 0xfaf07784 low byte is a result code (0 keeps the later
+        // kernel path from writing a flash configuration page).
+        // The same block is polled at +0x7800 (`& 1 == 1`, stage0 generic poll
+        // over the four memory-configuration bases 0xfaf00000..0xfaf30000).
+        for base in [0xfaf0_7000u64, 0xfaf1_7000, 0xfaf2_7000, 0xfaf3_7000] {
+            windows.push(stub(base, vec![
+                json!({"offset": 0x780, "mode": "after_write", "value": 1}),
+                json!({"offset": 0x784, "mode": "constant", "value": 0}),
+                json!({"offset": 0x800, "mode": "constant", "value": 1}),
+            ])?);
+        }
+        for (base, registers) in &args.stubs {
+            windows.retain(|w| w.base != *base);
+            windows.push(stub(*base, registers.clone())?);
+        }
+    }
+    // SD host for the card start. The XP5 catalog declares no SD controller;
+    // the base is fujimod-recovery's XP5 `board.host` (0xff9b0000). The
+    // emulator's SDHCI model stands in for the real host, whose register map
+    // is unverified.
+    const SD_HOST: u64 = 0xff9b_0000;
+    let mut sd_media = BTreeMap::new();
+    if args.start == "sdcard" {
+        let dir = args.sd_dir.as_ref().ok_or("--start sdcard requires --sd-dir DIR")?;
+        // The card loader enables the host interrupt output; route it to an
+        // otherwise unused GIC line (the loader polls, nothing consumes it).
+        let options = toml::Value::try_from(json!({"controller": {
+            "base": SD_HOST, "protocol": "sdhc", "transfer_ticks": 4, "clock_ticks": 2, "rca": 1,
+            "ram_bytes": DRAM_LIMIT, "high_speed": false,
+        }, "irq": 500})).map_err(|e| e.to_string())?;
+        let toml::Value::Table(options) = options else { return Err("sdhci options".into()) };
+        windows.push(fujimod_emulator_devices::graph::DeviceWindow { base: SD_HOST, size: 0x1000, kind: "sdhci".into(), options });
+        let mut assets = BTreeMap::new();
+        let mut files = vec![];
+        let mut names: Vec<_> = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?
+            .filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file()).collect();
+        names.sort();
+        for path in names {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            eprintln!("card file {name}: {} bytes", bytes.len());
+            assets.insert(name.clone(), bytes);
+            files.push((name.clone(), name));
+        }
+        if !assets.contains_key("marble_init.bin") {
+            return Err(format!("{}: no marble_init.bin", dir.display()));
+        }
+        let inputs = xp5_board::sd::MediaInputs {
+            base: SD_HOST,
+            format: fujimod_emulator_storage::fat::Options {
+                sectors: 0x80_0000,
+                max_dirty_sectors: 0x100000,
+                partition_start: 8192,
+                sectors_per_cluster: 64,
+                label: "BOOT".into(),
+                read_only_files: vec![],
+            },
+            files,
+            present: true,
+            protected: false,
+        };
+        sd_media = xp5_board::sd::resolve(vec![inputs], &assets)?;
+    }
     let mut displays = BTreeMap::new();
     for w in windows.iter().filter(|w| w.kind == "display") {
         displays.insert(w.base, display::Config { period_ns: None, raw_formats: [None; 4] });
     }
     let storage = flash_storage::Storage::new(flash.clone())?;
     let resources = xp5_board::Resources {
-        sd: BTreeMap::new(),
+        sd: sd_media,
         controls: Arc::new(fujimod_emulator_parts_controls::absent::AbsentControls),
         pins: fujimod_emulator_devices::xp5::pins::Pins::shared(),
         clocks: fujimod_emulator_devices::xp5::panel_clocks::Clocks::new(),
@@ -545,8 +671,15 @@ fn run() -> Result<(), String> {
 
     let mut images = vec![];
     if args.start == "stage0" {
-        let size = u32::from_le_bytes(flash[0x10..0x14].try_into().unwrap()) as usize;
-        images.push(boot::MemoryImage { address: BOOT_SRAM, bytes: flash[..size].to_vec() });
+        // Header word 0x10 is the ROM copy length; the copy starts after the
+        // 0x800-byte header and lands at the SRAM base.
+        let size = u32::from_le_bytes(flash[0x10..0x14].try_into().unwrap()) as usize & 0x3fff_ffff;
+        images.push(boot::MemoryImage { address: BOOT_SRAM, bytes: flash[0x800..0x800 + size].to_vec() });
+    }
+    if args.start == "sdcard" {
+        let path = args.sd_dir.as_ref().unwrap().join("marble_init.bin");
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        images.push(boot::MemoryImage { address: BOOT_SRAM, bytes });
     }
     {
         let mut xip = flash.clone();
