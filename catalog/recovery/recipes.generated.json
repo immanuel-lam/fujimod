@@ -15755,36 +15755,6 @@
     "missing": []
   },
   {
-    "firmware_id": "xt5-431",
-    "source_size": 109365284,
-    "source_sha256": "790d6deecf26766188b0e506e40645e6b816addfeba39a52334349405421724e",
-    "update_filename": "FWUP0030.DAT",
-    "generation": "xp5",
-    "plan": null,
-    "packaging": null,
-    "exr": null,
-    "setup": null,
-    "xp5": null,
-    "cold_start": null,
-    "file_api": null,
-    "sd_boot": {
-      "hold": [
-        {
-          "id": "front_command_dial.press"
-        },
-        {
-          "id": "rear_command_dial.press"
-        }
-      ]
-    },
-    "firmware_update": null,
-    "updater": null,
-    "missing": [
-      "version-independent stock updater acceptance",
-      "XP5 bindings: setup/header: No unique aligned AArch64 reset register-clear sequence"
-    ]
-  },
-  {
     "firmware_id": "xt50-132",
     "source_size": 110561484,
     "source_sha256": "2c360848736985531db407c8597911f1b701b4a854dc3b9b949ccc9f7b274212",
@@ -15813,6 +15783,498 @@
     "missing": [
       "version-independent stock updater acceptance",
       "XP5 bindings: sd_route: expected one complete instruction contract, found 0"
+    ]
+  },
+  {
+    "firmware_id": "xt5-431",
+    "source_size": 109365284,
+    "updater": null,
+    "source_sha256": "790d6deecf26766188b0e506e40645e6b816addfeba39a52334349405421724e",
+    "update_filename": "FWUP0030.DAT",
+    "generation": "xp5",
+    "plan": {
+      "size": 82247680,
+      "entry": 0,
+      "regions": [
+        {
+          "name": "reset stage",
+          "address": 0,
+          "source": {
+            "dat_offset": 164468,
+            "size": 81920,
+            "compression": "raw",
+            "decoded_size": 81920,
+            "sha256": "280476c96acd2ed0a3cb956467b2dd04185c651eb6bbedcf43d5c4aa4ae1cb14"
+          }
+        },
+        {
+          "name": "partition table",
+          "address": 17563648,
+          "source": {
+            "dat_offset": 1704564,
+            "size": 2048,
+            "compression": "raw",
+            "decoded_size": 2048,
+            "sha256": "8fbd84f3dbe3ab4ad5a468f40611827e1bab7030827f610c6929bdb96a4933c2"
+          }
+        },
+        {
+          "name": "partition0",
+          "address": 262144,
+          "source": {
+            "dat_offset": 393844,
+            "size": 123520,
+            "compression": "raw",
+            "decoded_size": 123520,
+            "sha256": "84a2cfa813d6ce289a4dbd86488da73d943bc22661d72ef14d305a8a35f5f8d3"
+          }
+        },
+        {
+          "name": "partition1",
+          "address": 5767168,
+          "source": {
+            "dat_offset": 38404724,
+            "size": 3768320,
+            "compression": "method4",
+            "decoded_size": 7336440,
+            "sha256": "bc4ed69b2d6781da36146a73a720a72cdd8a1fcc976a77167763540cedaf20e5"
+          }
+        },
+        {
+          "name": "partition2",
+          "address": 15335424,
+          "source": {
+            "dat_offset": 43254388,
+            "size": 688086,
+            "compression": "raw",
+            "decoded_size": 688086,
+            "sha256": "da5ad2a9b725b51d0f4162bbf5cd680194a84c898bb1e49008853d418c0d5a28"
+          }
+        },
+        {
+          "name": "partition4",
+          "address": 17829888,
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5357568,
+            "compression": "method4",
+            "decoded_size": 11743456,
+            "sha256": "fd5f899217a833552f135d719d22e025aea2e0780b2fd1f8c66b353ead969724"
+          }
+        },
+        {
+          "name": "partition5",
+          "address": 42905600,
+          "source": {
+            "dat_offset": 8520308,
+            "size": 7340032,
+            "compression": "method4",
+            "decoded_size": 15446016,
+            "sha256": "d74dba337fe4078a6ee15ca5fddba7e502bdefb980825a09a15f9b13a01eb350"
+          }
+        }
+      ],
+      "bss": [
+        {
+          "name": "partition0",
+          "address": 385664,
+          "size": 4586880
+        },
+        {
+          "name": "partition4",
+          "address": 29577216,
+          "size": 13328384
+        },
+        {
+          "name": "partition5",
+          "address": 58351616,
+          "size": 23896064
+        }
+      ],
+      "edits": [
+        {
+          "address": 72192,
+          "old": 1,
+          "new": 0,
+          "what": "stage1: images already in DRAM, skip the flash loads (0x11a00)"
+        }
+      ]
+    },
+    "packaging": null,
+    "exr": null,
+    "setup": null,
+    "xp5": {
+      "prefix": {
+        "dat_offset": 628,
+        "size": 262144,
+        "compression": "raw",
+        "decoded_size": 262144,
+        "sha256": "3f5637eecf6697cc4fe55579b9b7e8ee61983988a820f8e1f1e447350b08f256"
+      },
+      "low_length": 73728,
+      "length_flags": 0,
+      "base": 4286578688,
+      "stack": 4286666752,
+      "bootstrap_offset": 2128,
+      "initialize_offset": 2184,
+      "gate_offset": 2168,
+      "continuation": 4026691984,
+      "initializer": {
+        "address": 4286578824,
+        "size": 940,
+        "sha256": "2af0e1576ad1820cf9d9b89a82f2e4489c1b425864fefac87368e6c4cc301b9a"
+      },
+      "delay": {
+        "address": 4286583048,
+        "size": 160,
+        "sha256": "12c1bfd4a1e801daecb2228483f5a88ab3e970aff0c9d2dcf9d2971d5bb98be7"
+      },
+      "reset_dat": 164468,
+      "reset_copy_size": 81920,
+      "selector": 72192,
+      "flash": {
+        "controller": 4287668224,
+        "aperture": 4026531840,
+        "window_mask": 4160749568,
+        "clock": 4288778304,
+        "clock_commit": 4288778368,
+        "pins": [
+          {
+            "address": 4287672320,
+            "value": 131074
+          },
+          {
+            "address": 4287672324,
+            "value": 983055
+          },
+          {
+            "address": 4287672328,
+            "value": 1073692671
+          },
+          {
+            "address": 4287672332,
+            "value": 1426412805
+          },
+          {
+            "address": 4287672336,
+            "value": 22348117
+          },
+          {
+            "address": 4287672340,
+            "value": 1072840690
+          }
+        ]
+      },
+      "lamp": {
+        "pio_base": 4287655936,
+        "clock_address": 4287677208,
+        "clock_mask": 131072,
+        "reset_address": 4287678764,
+        "reset_mask": 65536,
+        "green_port": 8,
+        "red_port": 6,
+        "pin": 2
+      },
+      "board": {
+        "host": 4288348160,
+        "timeout_setting": 14,
+        "operations": []
+      },
+      "proofs": [
+        {
+          "source": {
+            "dat_offset": 628,
+            "size": 262144,
+            "compression": "raw",
+            "decoded_size": 262144,
+            "sha256": "3f5637eecf6697cc4fe55579b9b7e8ee61983988a820f8e1f1e447350b08f256"
+          },
+          "offset": 2128,
+          "size": 48,
+          "sha256": "2da5515c235238af76bb2446fb7b83849c3126dc959171e24c889fb56b772240"
+        },
+        {
+          "source": {
+            "dat_offset": 628,
+            "size": 262144,
+            "compression": "raw",
+            "decoded_size": 262144,
+            "sha256": "3f5637eecf6697cc4fe55579b9b7e8ee61983988a820f8e1f1e447350b08f256"
+          },
+          "offset": 70408,
+          "size": 108,
+          "sha256": "0e5b93c549ff9d806cc728958d96bda554904362129efaf4b477466f1a1239db"
+        }
+      ],
+      "banks": {
+        "copies": [],
+        "edits": []
+      }
+    },
+    "cold_start": null,
+    "file_api": null,
+    "sd_boot": {
+      "hold": [
+        {
+          "id": "front_command_dial.press"
+        },
+        {
+          "id": "rear_command_dial.press"
+        }
+      ]
+    },
+    "firmware_update": null,
+    "missing": [
+      "version-independent stock updater acceptance",
+      "X-T5 status-lamp GPIO binding unverified (X-M5 1.30 values copied)",
+      "X-T5 SD pad routing operations not located (none emitted)",
+      "partitions 3 and 6 have no fixed DRAM address and are not preloaded"
+    ]
+  },
+  {
+    "firmware_id": "xt5-431-m4ok",
+    "source_size": 109365284,
+    "updater": null,
+    "source_sha256": "f207136ebae7dc54a663341a96ae912863ca646d80ced5512c877eea31b33709",
+    "update_filename": "FWUP0030.DAT",
+    "generation": "xp5",
+    "plan": {
+      "size": 82247680,
+      "entry": 0,
+      "regions": [
+        {
+          "name": "reset stage",
+          "address": 0,
+          "source": {
+            "dat_offset": 164468,
+            "size": 81920,
+            "compression": "raw",
+            "decoded_size": 81920,
+            "sha256": "280476c96acd2ed0a3cb956467b2dd04185c651eb6bbedcf43d5c4aa4ae1cb14"
+          }
+        },
+        {
+          "name": "partition table",
+          "address": 17563648,
+          "source": {
+            "dat_offset": 1704564,
+            "size": 2048,
+            "compression": "raw",
+            "decoded_size": 2048,
+            "sha256": "8fbd84f3dbe3ab4ad5a468f40611827e1bab7030827f610c6929bdb96a4933c2"
+          }
+        },
+        {
+          "name": "partition0",
+          "address": 262144,
+          "source": {
+            "dat_offset": 393844,
+            "size": 123520,
+            "compression": "raw",
+            "decoded_size": 123520,
+            "sha256": "84a2cfa813d6ce289a4dbd86488da73d943bc22661d72ef14d305a8a35f5f8d3"
+          }
+        },
+        {
+          "name": "partition1",
+          "address": 5767168,
+          "source": {
+            "dat_offset": 38404724,
+            "size": 3768320,
+            "compression": "method4",
+            "decoded_size": 7336440,
+            "sha256": "bc4ed69b2d6781da36146a73a720a72cdd8a1fcc976a77167763540cedaf20e5"
+          }
+        },
+        {
+          "name": "partition2",
+          "address": 15335424,
+          "source": {
+            "dat_offset": 43254388,
+            "size": 688086,
+            "compression": "raw",
+            "decoded_size": 688086,
+            "sha256": "da5ad2a9b725b51d0f4162bbf5cd680194a84c898bb1e49008853d418c0d5a28"
+          }
+        },
+        {
+          "name": "partition4",
+          "address": 17829888,
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5357568,
+            "compression": "method4",
+            "decoded_size": 11743456,
+            "sha256": "fd5f899217a833552f135d719d22e025aea2e0780b2fd1f8c66b353ead969724"
+          }
+        },
+        {
+          "name": "partition5",
+          "address": 42905600,
+          "source": {
+            "dat_offset": 8520308,
+            "size": 7340032,
+            "compression": "method4",
+            "decoded_size": 15446016,
+            "sha256": "d74dba337fe4078a6ee15ca5fddba7e502bdefb980825a09a15f9b13a01eb350"
+          }
+        }
+      ],
+      "bss": [
+        {
+          "name": "partition0",
+          "address": 385664,
+          "size": 4586880
+        },
+        {
+          "name": "partition4",
+          "address": 29577216,
+          "size": 13328384
+        },
+        {
+          "name": "partition5",
+          "address": 58351616,
+          "size": 23896064
+        }
+      ],
+      "edits": [
+        {
+          "address": 72192,
+          "old": 1,
+          "new": 0,
+          "what": "stage1: images already in DRAM, skip the flash loads (0x11a00)"
+        }
+      ]
+    },
+    "packaging": null,
+    "exr": null,
+    "setup": null,
+    "xp5": {
+      "prefix": {
+        "dat_offset": 628,
+        "size": 262144,
+        "compression": "raw",
+        "decoded_size": 262144,
+        "sha256": "3f5637eecf6697cc4fe55579b9b7e8ee61983988a820f8e1f1e447350b08f256"
+      },
+      "low_length": 73728,
+      "length_flags": 0,
+      "base": 4286578688,
+      "stack": 4286666752,
+      "bootstrap_offset": 2128,
+      "initialize_offset": 2184,
+      "gate_offset": 2168,
+      "continuation": 4026691984,
+      "initializer": {
+        "address": 4286578824,
+        "size": 940,
+        "sha256": "2af0e1576ad1820cf9d9b89a82f2e4489c1b425864fefac87368e6c4cc301b9a"
+      },
+      "delay": {
+        "address": 4286583048,
+        "size": 160,
+        "sha256": "12c1bfd4a1e801daecb2228483f5a88ab3e970aff0c9d2dcf9d2971d5bb98be7"
+      },
+      "reset_dat": 164468,
+      "reset_copy_size": 81920,
+      "selector": 72192,
+      "flash": {
+        "controller": 4287668224,
+        "aperture": 4026531840,
+        "window_mask": 4160749568,
+        "clock": 4288778304,
+        "clock_commit": 4288778368,
+        "pins": [
+          {
+            "address": 4287672320,
+            "value": 131074
+          },
+          {
+            "address": 4287672324,
+            "value": 983055
+          },
+          {
+            "address": 4287672328,
+            "value": 1073692671
+          },
+          {
+            "address": 4287672332,
+            "value": 1426412805
+          },
+          {
+            "address": 4287672336,
+            "value": 22348117
+          },
+          {
+            "address": 4287672340,
+            "value": 1072840690
+          }
+        ]
+      },
+      "lamp": {
+        "pio_base": 4287655936,
+        "clock_address": 4287677208,
+        "clock_mask": 131072,
+        "reset_address": 4287678764,
+        "reset_mask": 65536,
+        "green_port": 8,
+        "red_port": 6,
+        "pin": 2
+      },
+      "board": {
+        "host": 4288348160,
+        "timeout_setting": 14,
+        "operations": []
+      },
+      "proofs": [
+        {
+          "source": {
+            "dat_offset": 628,
+            "size": 262144,
+            "compression": "raw",
+            "decoded_size": 262144,
+            "sha256": "3f5637eecf6697cc4fe55579b9b7e8ee61983988a820f8e1f1e447350b08f256"
+          },
+          "offset": 2128,
+          "size": 48,
+          "sha256": "2da5515c235238af76bb2446fb7b83849c3126dc959171e24c889fb56b772240"
+        },
+        {
+          "source": {
+            "dat_offset": 628,
+            "size": 262144,
+            "compression": "raw",
+            "decoded_size": 262144,
+            "sha256": "3f5637eecf6697cc4fe55579b9b7e8ee61983988a820f8e1f1e447350b08f256"
+          },
+          "offset": 70408,
+          "size": 108,
+          "sha256": "0e5b93c549ff9d806cc728958d96bda554904362129efaf4b477466f1a1239db"
+        }
+      ],
+      "banks": {
+        "copies": [],
+        "edits": []
+      }
+    },
+    "cold_start": null,
+    "file_api": null,
+    "sd_boot": {
+      "hold": [
+        {
+          "id": "front_command_dial.press"
+        },
+        {
+          "id": "rear_command_dial.press"
+        }
+      ]
+    },
+    "firmware_update": null,
+    "missing": [
+      "version-independent stock updater acceptance",
+      "X-T5 status-lamp GPIO binding unverified (X-M5 1.30 values copied)",
+      "X-T5 SD pad routing operations not located (none emitted)",
+      "partitions 3 and 6 have no fixed DRAM address and are not preloaded"
     ]
   }
 ]

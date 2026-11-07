@@ -148,10 +148,13 @@ impl Pair {
         // SA serializes each source access before its destination access.
         // Every beat here already performs that ordered data movement.
         // The request-descriptor option sets bit 0 in both shape registers.
+        // Burst-length bits (0xf00) only group beats on the bus; the modeled
+        // transfer moves every beat in order, so they are accepted and ignored.
+        // The X-T5 stage0 setup programs 0x30f00 for its memory-to-memory copies.
         let shape_mask = if c.control & REQUEST_OPTION != 0 {
-            0x30005
+            0x30f05
         } else {
-            0x30004
+            0x30f04
         };
         if c.counter_exhausted
             || c.control
