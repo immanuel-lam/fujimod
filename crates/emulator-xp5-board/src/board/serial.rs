@@ -21,7 +21,14 @@ pub(super) struct Connection {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum Part {
-    PowerController { rtc_seconds: u32, rtc_valid: bool },
+    PowerController {
+        rtc_seconds: u32,
+        rtc_valid: bool,
+        /// xt5-bringup: initial register overrides (address -> value), for
+        /// example register 0 bit 7, which the X-T5 stage1 polls at boot.
+        #[serde(default)]
+        registers: std::collections::BTreeMap<String, u16>,
+    },
     SerialCalibrationRegisters { miso_high: bool },
     BisConfigurationRegisters { revision: [u8; 2], idle_high: bool },
     Lsm6dsConfigurationRegisters,
@@ -123,9 +130,15 @@ fn endpoint(part: Part, controls: Option<Arc<dyn Controls>>) -> Result<Box<dyn E
         Part::PowerController {
             rtc_seconds,
             rtc_valid,
+            registers,
         } => {
             let mut part = PowerController::new();
             part.configure_rtc(rtc_seconds, rtc_valid);
+            for (address, value) in registers {
+                let address = u8::from_str_radix(address.trim_start_matches("0x"), 16)
+                    .map_err(|e| format!("power-controller register {address}: {e}"))?;
+                part.set_register(address, value);
+            }
             match controls
                 .map(|controls| (controls.register_ladders(), controls))
                 .filter(|(registers, _)| !registers.is_empty())
@@ -234,6 +247,7 @@ mod tests {
     fn attach(controls: Arc<dyn Controls>) -> Box<dyn Endpoint> {
         endpoint(
             Part::PowerController {
+                registers: Default::default(),
                 rtc_seconds: 0,
                 rtc_valid: true,
             },

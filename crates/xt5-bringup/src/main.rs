@@ -67,6 +67,7 @@ struct Args {
     no_stubs: bool,
     /// Extra stub windows: (base, registers as bringup_stub JSON).
     stubs: Vec<(u64, Vec<Value>)>,
+    wake_ms: Option<u64>,
 }
 
 fn parse_u64(text: &str) -> Result<u64, String> {
@@ -113,6 +114,7 @@ fn args() -> Result<Args, String> {
         sd_dir: None,
         no_stubs: false,
         stubs: vec![],
+        wake_ms: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(key) = it.next() {
@@ -139,6 +141,9 @@ fn args() -> Result<Args, String> {
             "--start" => out.start = value()?,
             "--sd-dir" => out.sd_dir = Some(value()?.into()),
             "--no-stubs" => out.no_stubs = true,
+            // Wake cores 1-3 at guest time MS (SD start: the secondaries park
+            // in the stock flash loop until the emulator wakes them).
+            "--wake-secondaries-at" => out.wake_ms = Some(parse_u64(&value()?)?),
             "--stub" => {
                 // BASE:OFFSET=MODE[:VALUE][,OFFSET=MODE[:VALUE]...]; MODE as in bringup_stub::Mode.
                 let v = value()?;
@@ -265,7 +270,7 @@ fn snapshot(board: &fujimod_emulator::board::Board, core: usize) -> Value {
         "x19": r(Register::X(19)), "x20": r(Register::X(20)), "x21": r(Register::X(21)),
         "x30": r(Register::X(30)),
     });
-    for name in ["VBAR_EL1", "SCTLR_EL1", "SP_EL0", "SP_EL1", "ELR_EL1", "ESR_EL1", "FAR_EL1", "CNTV_CTL_EL0", "CNTV_CVAL_EL0", "0xdf11", "0xdf12", "ICC_PMR_EL1", "ICC_IGRPEN1_EL1", "TPIDR_EL1"] {
+    for name in ["VBAR_EL1", "SCTLR_EL1", "SP_EL0", "SP_EL1", "ELR_EL1", "ESR_EL1", "FAR_EL1", "CNTV_CTL_EL0", "CNTV_CVAL_EL0", "0xdf11", "0xdf12", "ICC_PMR_EL1", "ICC_IGRPEN1_EL1", "TPIDR_EL1", "0xc005", "0xc000"] {
         v[name] = json!(r(sysreg(name)));
     }
     v
@@ -510,8 +515,15 @@ fn run() -> Result<(), String> {
                 let endpoints = match block {
                     // Body wiring: spi8 -> power-controller, select GPIO 15/15 active high.
                     // Run inputs: power-controller clock 845151906 s, valid.
+                    // stage1 core 1 (0x37d0) polls register 0 until bit 15 is
+                    // set (ready), then reads register 0x10 and stores its low
+                    // byte's bits as the wake cause (boot-info +0x150); image 4
+                    // (0x14d9da8) powers down unless bit 1 (power switch) is set.
+                    // The handoff start synthesizes this field instead. Meanings
+                    // are inferred from the code paths, not from the part.
                     Some("spi8") => json!([{"select": {"port": 15, "pin": 15, "active_high": true},
-                            "part": {"kind": "power-controller", "rtc_seconds": 845151906u32, "rtc_valid": true}}]),
+                            "part": {"kind": "power-controller", "rtc_seconds": 845151906u32, "rtc_valid": true,
+                                     "registers": if matches!(args.start.as_str(), "stage0" | "sdcard") { json!({"0": 0x8202, "10": 0x0002}) } else { json!({}) }}}]),
                     // Traced X-T5 chip selects; parts unidentified.
                     Some("spi4") => json!([sink(12, 7)]),
                     Some("spi5") => json!([sink(12, 8)]),
@@ -594,6 +606,12 @@ fn run() -> Result<(), String> {
         for (base, registers) in &args.stubs {
             windows.retain(|w| w.base != *base);
             windows.push(stub(*base, registers.clone())?);
+        }
+        if let Some(ms) = args.wake_ms {
+            let options = toml::Value::try_from(json!({"registers": [], "wake_tick": ms * 1_000_000, "wake_cores": [1, 2, 3]}))
+                .map_err(|e| e.to_string())?;
+            let toml::Value::Table(options) = options else { return Err("wake options".into()) };
+            windows.push(fujimod_emulator_devices::graph::DeviceWindow { base: 0xfaf4_7000, size: 0x1000, kind: "bringup-stub".into(), options });
         }
     }
     // SD host for the card start. The XP5 catalog declares no SD controller;
@@ -744,7 +762,12 @@ fn run() -> Result<(), String> {
     }
     eprintln!("execution policy: {:?}", board.execution_policy());
     for (address, value) in &args.pokes {
-        board.write_physical(*address, &value.to_le_bytes()).map_err(|e| format!("poke {address:#x}: {e}"))?;
+        // RAM first; otherwise through core 0's bus view so device registers
+        // (for example GICR_WAKER) can be poked too.
+        board
+            .write_physical(*address, &value.to_le_bytes())
+            .or_else(|_| board.write_memory(0, *address, &value.to_le_bytes()))
+            .map_err(|e| format!("poke {address:#x}: {e}"))?;
     }
     // The boot ROM's register-init table, applied before the loader runs.
     if args.start == "stage0" {

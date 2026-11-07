@@ -6,7 +6,7 @@
 //! setup can proceed in the emulator. Every unlisted register in the window
 //! stores its last write and reads it back. This is a bring-up aid, not a
 //! model: the real hardware's behaviour behind these registers is unknown.
-use fujimod_emulator_devices::{Cx, Device};
+use fujimod_emulator_devices::{Cx, Device, checkpoint::Checkpoint};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -37,6 +37,13 @@ pub struct Register {
 #[serde(deny_unknown_fields)]
 pub struct Options {
     pub registers: Vec<Register>,
+    /// Board tick at which the listed cores are woken (a WFI park loop
+    /// continues; a held core is released). Stands in for the wake-up the
+    /// real boot chain delivers to the secondary cores.
+    #[serde(default)]
+    pub wake_tick: Option<u64>,
+    #[serde(default)]
+    pub wake_cores: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -47,6 +54,9 @@ struct State {
     stored: BTreeMap<u64, u64>,
     phase: BTreeMap<u64, bool>,
     written: BTreeMap<u64, bool>,
+    wake_tick: Option<u64>,
+    wake_cores: Vec<usize>,
+    woken: bool,
 }
 
 pub struct BringupStub {
@@ -69,6 +79,9 @@ impl BringupStub {
                 stored: BTreeMap::new(),
                 phase: BTreeMap::new(),
                 written: BTreeMap::new(),
+                wake_tick: options.wake_tick,
+                wake_cores: options.wake_cores,
+                woken: false,
             },
         })
     }
@@ -124,6 +137,45 @@ impl Device for BringupStub {
         };
         self.state.written.insert(offset, true);
         self.state.stored.insert(offset, value & Self::mask(size));
+    }
+
+    fn next_deadline(&self, _now: u64) -> Option<u64> {
+        self.state.wake_tick.filter(|_| !self.state.woken)
+    }
+
+    fn advance(&mut self, cx: &mut Cx<'_>) {
+        if self.state.woken || self.state.wake_tick.is_none_or(|t| cx.now() < t) {
+            return;
+        }
+        self.state.woken = true;
+        for &core in &self.state.wake_cores {
+            if let Err(error) = cx.reset_core(core, false) {
+                cx.unmodeled();
+                let _ = error;
+            }
+        }
+    }
+
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode(self.name(), &self.state)
+    }
+
+    fn validate_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), String> {
+        let state: State = checkpoint.decode(self.name())?;
+        if state.base != self.state.base || state.size != self.state.size {
+            return Err("bring-up stub checkpoint window differs".into());
+        }
+        Ok(())
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(checkpoint)?;
+        self.state = checkpoint.decode(self.name())?;
+        Ok(())
+    }
+
+    fn fingerprint(&self) -> Result<Value, String> {
+        Ok(serde_json::to_value(&self.state).unwrap())
     }
 
     fn save(&self) -> Value {
