@@ -596,7 +596,7 @@ fn run() -> Result<(), String> {
         board.observe_transactions(Some(args.trace_limit));
         tracing = true;
     }
-    let cores = 4usize;
+    let cores = 5usize;
     let started = Instant::now();
     let mut ran = 0u64;
     let mut result = Ok(());
@@ -710,6 +710,18 @@ fn run() -> Result<(), String> {
         }
     }
     eprintln!("frames per output: {frame_count:?}");
+    if let Ok(spec) = std::env::var("XT5_DUMP_CORE") {
+        // CORE:ADDR:LEN:PATH, read through that core's view.
+        let p: Vec<&str> = spec.splitn(4, ':').collect();
+        if p.len() != 4 {
+            return Err("XT5_DUMP_CORE must be CORE:ADDR:LEN:PATH".into());
+        }
+        let (core, addr, len) = (parse_u64(p[0])? as usize, parse_u64(p[1])?, parse_u64(p[2])? as usize);
+        let mut bytes = vec![0u8; len];
+        board.read_memory(core, addr, &mut bytes).map_err(|e| format!("core dump: {e}"))?;
+        std::fs::write(p[3], &bytes).map_err(|e| e.to_string())?;
+        eprintln!("dumped core {core} {addr:#x}+{len:#x} -> {}", p[3]);
+    }
     if let Ok(kinds) = std::env::var("XT5_DEVICE_STATES") {
         for kind in kinds.split(',') {
             eprintln!("device {kind}: {}", serde_json::to_string(&board.device_states(kind)?).unwrap());
