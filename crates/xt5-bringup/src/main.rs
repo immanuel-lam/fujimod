@@ -693,6 +693,8 @@ fn run() -> Result<(), String> {
             "core": e["core"], "pc": format!("{:#x}", e["pc"].as_u64().unwrap_or(0)),
             "x0_3": e["arguments"].as_array().map(|a| a.iter().map(|v| format!("{:#x}", v.as_u64().unwrap_or(0))).collect::<Vec<_>>()),
             "tick": e["tick"],
+            "sp": format!("{:#x}", e["sp"].as_u64().unwrap_or(0)),
+            "backtrace": e["backtrace"].as_array().map(|a| a.iter().map(|v| format!("{:#x}", v.as_u64().unwrap_or(0))).collect::<Vec<_>>()),
         })).collect::<Vec<_>>(),
         "waiting": state.get("waiting"),
     });
