@@ -51,6 +51,7 @@ struct Args {
     set_regs: Vec<(Option<usize>, String, u64)>,
     watch: Vec<u64>,
     pokes: Vec<(u64, u32)>,
+    gpio_inputs: Vec<(usize, usize, bool)>,
     frames_dir: Option<PathBuf>,
     policy: Option<String>,
     dumps: Vec<(u64, usize)>,
@@ -93,6 +94,7 @@ fn args() -> Result<Args, String> {
         set_regs: vec![],
         watch: vec![],
         pokes: vec![],
+        gpio_inputs: vec![],
         frames_dir: None,
         policy: None,
         dumps: vec![],
@@ -161,6 +163,14 @@ fn args() -> Result<Args, String> {
                     (0xf469000, "dram_0f469000_image4_staging.bin"),
                 ] {
                     out.images.push((addr, dir.join(name)));
+                }
+            }
+            "--gpio" => {
+                // PORT:PIN=LEVEL, an external GPIO input level set before the run.
+                for item in value()?.split(',') {
+                    let (pp, level) = item.split_once('=').ok_or("--gpio PORT:PIN=0|1")?;
+                    let (port, pin) = pp.split_once(':').ok_or("--gpio PORT:PIN=0|1")?;
+                    out.gpio_inputs.push((port.parse().map_err(|_| "bad GPIO port")?, pin.parse().map_err(|_| "bad GPIO pin")?, level == "1"));
                 }
             }
             "--poke" => {
@@ -416,7 +426,13 @@ fn run() -> Result<(), String> {
             w.options.entry("source_luma").or_insert(toml_int(128));
         }
         if matches!(w.kind.as_str(), "imaging-preview" | "movdc") {
-            w.options.entry("frame_period_us").or_insert(toml_int(1_000_000));
+            // The REC start sequence gives up after about 1 s without a frame, so
+            // the receiver must deliver frames at a camera-like rate (default 30 fps).
+            let period = std::env::var("XT5_FRAME_PERIOD_US")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(33_333);
+            w.options.insert("frame_period_us".into(), toml_int(period));
             w.options.entry("source_luma").or_insert(toml_int(128));
         }
         if w.kind == "adc" {
@@ -470,7 +486,13 @@ fn run() -> Result<(), String> {
             w.options.entry("completion_us").or_insert(toml_int(1000));
         }
         if w.kind == "imaging-receiver" {
-            w.options.entry("frame_period_us").or_insert(toml_int(1_000_000));
+            // The REC start sequence gives up after about 1 s without a frame, so
+            // the receiver must deliver frames at a camera-like rate (default 30 fps).
+            let period = std::env::var("XT5_FRAME_PERIOD_US")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(33_333);
+            w.options.insert("frame_period_us".into(), toml_int(period));
         }
     }
     for w in windows.iter_mut().filter(|w| w.kind == "flash-storage") {
@@ -538,11 +560,6 @@ fn run() -> Result<(), String> {
         images: vec![],
         scene: None,
     })?;
-    for (at_ms, key, hold_ms) in &args.presses {
-        let key = fujimod_emulator_xp5_board::session::Key::parse(key)?;
-        inputs.key(&mut session, at_ms * 1_000_000, key, true)?;
-        inputs.key(&mut session, (at_ms + hold_ms) * 1_000_000, key, false)?;
-    }
     let board = &mut session.board;
     eprintln!("opened: omitted {omitted:?}");
     for image in &images {
@@ -559,6 +576,16 @@ fn run() -> Result<(), String> {
         let snapshot = session.import_snapshot(&bytes)?;
         session.restore(&snapshot)?;
         eprintln!("restored snapshot {} at t={}", path.display(), session.board.now());
+    }
+    for &(port, pin, high) in &args.gpio_inputs {
+        inputs.gpio(&mut session, port, pin, high)?;
+        eprintln!("gpio input {port}:{pin} = {}", high as u8);
+    }
+    // Schedule key presses after any snapshot restore, which replaces the input queue.
+    for (at_ms, key, hold_ms) in &args.presses {
+        let key = fujimod_emulator_xp5_board::session::Key::parse(key)?;
+        inputs.key(&mut session, at_ms * 1_000_000, key, true)?;
+        inputs.key(&mut session, (at_ms + hold_ms) * 1_000_000, key, false)?;
     }
     let board = &mut session.board;
     if let Some(policy) = &args.policy {
