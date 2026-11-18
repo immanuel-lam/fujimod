@@ -2703,6 +2703,8 @@ dependencies = [
  "fujimod-emulator-cpu",
  "fujimod-emulator-devices",
  "fujimod-emulator-graphics",
+ "fujimod-emulator-image-codecs",
+ "fujimod-emulator-imaging",
  "fujimod-emulator-ip",
  "fujimod-emulator-ip-arm",
  "fujimod-emulator-ip-dmp",
