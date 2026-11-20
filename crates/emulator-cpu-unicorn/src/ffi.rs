@@ -12,6 +12,9 @@ pub const FEATURE_REPLACED_INSTRUCTIONS: u32 = 1 << 5;
 pub const FEATURE_AARCH64_ACCOUNTING: u32 = 1 << 6;
 pub const FEATURE_INLINE_INSTRUCTION_COUNTER: u32 = 1 << 7;
 pub const FEATURE_INLINE_BLOCK_ACCOUNTING: u32 = 1 << 8;
+pub const FEATURE_BLOCK_CHAINS: u32 = 1 << 10;
+pub const FEATURE_HOOKS_KEEP_ITSTATE: u32 = 1 << 11;
+pub const FEATURE_STORE_WATCHED: u32 = 1 << 12;
 pub const FEATURE_TLBI_OWNER: u32 = 1 << 9;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,6 +97,14 @@ pub struct Extensions {
     // uc_embedder_accounting (features bit 2): the engine's accounting record.
     pub accounting: Option<unsafe extern "C" fn(Engine) -> *mut Accounting>,
     pub exit_counters: Option<unsafe extern "C" fn(Engine) -> *const u64>,
+    // Block chains (features bit 1024): the switch, the shared record and the
+    // admission of the block a block hook was called for.
+    pub set_block_chains: Option<unsafe extern "C" fn(Engine, bool) -> Error>,
+    pub block_chain: Option<unsafe extern "C" fn(Engine) -> *mut c_void>,
+    pub admit_block: Option<unsafe extern "C" fn(Engine, u32, u32, u64) -> Error>,
+    // uc_embedder_store_watched (features bit 4096): whether a store is
+    // certain to reach watched write hooks.
+    pub store_watched: Option<unsafe extern "C" fn(Engine, u64, u64) -> bool>,
 }
 
 impl Extensions {
@@ -264,6 +275,10 @@ mod linked {
         fn uc_embedder_instruction_counter(engine: Engine) -> u64;
         fn uc_embedder_accounting(engine: Engine) -> *mut Accounting;
         fn uc_embedder_exit_counters(engine: Engine) -> *const u64;
+        fn uc_embedder_set_block_chains(engine: Engine, enabled: bool) -> Error;
+        fn uc_embedder_block_chain(engine: Engine) -> *mut c_void;
+        fn uc_embedder_admit_block(engine: Engine, weight: u32, key: u32, tag: u64) -> Error;
+        fn uc_embedder_store_watched(engine: Engine, address: u64, size: u64) -> bool;
         fn uc_embedder_features() -> u32;
     }
     pub fn extensions() -> Extensions {
@@ -287,6 +302,10 @@ mod linked {
             instruction_counter: Some(uc_embedder_instruction_counter),
             accounting: Some(uc_embedder_accounting),
             exit_counters: Some(uc_embedder_exit_counters),
+            set_block_chains: Some(uc_embedder_set_block_chains),
+            block_chain: Some(uc_embedder_block_chain),
+            admit_block: Some(uc_embedder_admit_block),
+            store_watched: Some(uc_embedder_store_watched),
             features: unsafe { uc_embedder_features() },
         }
     }

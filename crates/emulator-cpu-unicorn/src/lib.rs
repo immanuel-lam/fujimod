@@ -32,6 +32,10 @@ mod actlr_tests;
 mod alignment_tests;
 #[cfg(test)]
 mod code_store_tests;
+#[cfg(test)]
+mod block_chain_tests;
+#[cfg(test)]
+mod it_block_hook_tests;
 pub mod jit;
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::BTreeMap;
@@ -1181,6 +1185,42 @@ impl Cpu for Core {
             return None;
         }
         NonNull::new(unsafe { self.api.extensions.accounting.unwrap()(self.raw) }.cast())
+    }
+    fn block_chains(&self, on: bool) -> Result<Option<NonNull<BlockChain>>, String> {
+        let e = &self.api.extensions;
+        let (Some(set), Some(record), Some(_)) = (e.set_block_chains, e.block_chain, e.admit_block)
+        else {
+            return Ok(None);
+        };
+        // A hooked store may stay inside a chained block only on an engine
+        // whose memory hooks leave ITSTATE alone when they return, and that
+        // can tell which stores always reach the hook (`store_watched`).
+        if e.features & ffi::FEATURE_BLOCK_CHAINS == 0
+            || e.features & ffi::FEATURE_HOOKS_KEEP_ITSTATE == 0
+            || e.features & ffi::FEATURE_STORE_WATCHED == 0
+            || e.store_watched.is_none()
+        {
+            return Ok(None);
+        }
+        self.check_tlbi_mutation()?;
+        self.check(unsafe { set(self.raw, on) })?;
+        Ok(NonNull::new(unsafe { record(self.raw) }.cast()))
+    }
+    #[inline]
+    fn admit_block(&self, weight: u32, key: u32, tag: u64) -> Result<(), String> {
+        let admit = self
+            .api
+            .extensions
+            .admit_block
+            .ok_or("CPU backend has no block chains")?;
+        self.check(unsafe { admit(self.raw, weight, key, tag) })
+    }
+    #[inline]
+    fn store_watched(&self, address: u64, bytes: u64) -> bool {
+        self.api
+            .extensions
+            .store_watched
+            .is_some_and(|watched| unsafe { watched(self.raw, address, bytes) })
     }
     unsafe fn observe_backings(&self, ranges: &[BackingObserver]) -> Result<(), String> {
         self.check_tlbi_mutation()?;

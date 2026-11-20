@@ -526,6 +526,34 @@ pub struct BlockAccounting {
     pub enabled: u64,
     pub pause_requested: *const AtomicU32,
 }
+/// Block chains: the record a backend's translated code shares with the
+/// owner of the block hook. One admitted run can then cover several
+/// translated blocks without a hook call for each.
+///
+/// A block hook may admit the block it was called for (`Cpu::admit_block`)
+/// with a weight, a key and a tag. From then on that translation is entered
+/// without its hook while `guards[slot]` equals its key, where `slot` is
+/// bits 12..17 of its address, and `budget` is at least its weight: the
+/// translated code subtracts the weight from `budget` and stores the tag in
+/// `last`. Every other entry calls the hook as before, and so does every
+/// entry while a stop is requested. Only the owner sets `budget`; it clears
+/// it before it asks for a stop, a retry or a restart. Fields match the
+/// backend's ABI; the owner accesses the record only in a hook or while
+/// execution is stopped.
+#[repr(C)]
+pub struct BlockChain {
+    pub budget: i64,
+    pub last: u64,
+    pub guards: [u32; BlockChain::GUARDS],
+}
+impl BlockChain {
+    pub const GUARDS: usize = 64;
+    /// The guard word a block at `address` is tested against.
+    #[inline]
+    pub fn slot(address: u64) -> usize {
+        (address >> 12) as usize & (Self::GUARDS - 1)
+    }
+}
 /// A checkpoint associated with an owning processor. Durable export carries
 /// data only; `Cpu::import_snapshot` binds that data to a receiving processor.
 pub trait Snapshot: Any {
@@ -871,6 +899,28 @@ pub trait Cpu {
     fn retry_block(&self, instructions: u32) -> Result<(), String>;
     fn request_restart(&self) -> Result<(), String>;
     fn accounting(&self) -> Option<NonNull<BlockAccounting>>;
+    /// Select whether translated blocks carry the block chain test, and get
+    /// the shared record. `None`: the backend has no block chains. Changing
+    /// the selection discards translations. With nothing admitted and a zero
+    /// budget, every block calls its hook as without chains.
+    fn block_chains(&self, _on: bool) -> Result<Option<NonNull<BlockChain>>, String> {
+        Ok(None)
+    }
+    /// From a block hook: admit the block the hook was called for
+    /// (`BlockChain`). The admission describes that translation and ends
+    /// with it. `weight` 0 withdraws it; `key` is never `u32::MAX`.
+    fn admit_block(&self, _weight: u32, _key: u32, _tag: u64) -> Result<(), String> {
+        Err("CPU backend has no block chains".into())
+    }
+    /// Whether a store into `[address, address + bytes)` is certain to reach
+    /// a store hook that sees only watched pages (`watch_stores`,
+    /// `hook_watched`). A backend may also call such a hook for a store
+    /// elsewhere, when its own state sends that store down the slow path;
+    /// the same store done again may then not reach the hook. `false` when
+    /// the backend cannot tell.
+    fn store_watched(&self, _address: u64, _bytes: u64) -> bool {
+        false
+    }
     /// # Safety
     /// The bitmap is writable and covers every backing page; both buffers
     /// outlive observation and are accessed only under the owner's CPU rules.
