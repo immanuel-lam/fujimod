@@ -3,8 +3,13 @@ pub mod aprofile;
 pub mod armv7a;
 pub mod bus;
 mod code_shadow;
+mod mprofile_blocks;
+#[cfg(test)]
+mod mprofile_blocks_tests;
 #[cfg(test)]
 mod code_shadow_tests;
+#[cfg(test)]
+mod store_hook_tests;
 pub mod continuation;
 pub mod decoder;
 #[cfg(test)]
@@ -59,6 +64,15 @@ pub use interrupts::{InterruptMap, InterruptRegisters};
 struct CoreInterruptMap {
     device: usize,
     inputs: Box<dyn fujimod_emulator_devices::bus::CoreInterrupts>,
+}
+/// Whether the board observes every instruction entry of this processor
+/// (`before`), instead of settling its entries in batches.
+fn observes_every_instruction(cpu: &dyn Cpu) -> bool {
+    let features = cpu.features();
+    !(cpu.model() != fujimod_emulator_cpu::Model::CortexM4
+        && features.architectural_exits
+        && features.instruction_progress
+        && features.tighten_instruction_limit)
 }
 fn device_workers(policy: ExecutionPolicy, preference: usize) -> usize {
     match policy {
@@ -201,6 +215,11 @@ struct State {
     // Host-only: proves an M-profile processor's translations still match
     // memory after a peer ran, so its code cache survives the peer's slice.
     code_shadow: Vec<Option<code_shadow::CodeShadow>>,
+    // Host-only: block execution of M-profile processors.
+    blocks: Vec<Option<mprofile_blocks::Blocks>>,
+    // Host-only: entries the instruction observer saw in the current engine
+    // run, as the engine's own counter counts them.
+    run_entries: Vec<u64>,
     // Host-only: lets an instruction observer skip interrupt bookkeeping
     // that provably has nothing to do.
     settled: Settled,
@@ -225,6 +244,10 @@ struct Settled {
     /// Both calls are a fixed point until guest time reaches `until`.
     armed: bool,
     until: u64,
+    /// While armed: the M-profile processor whose observer armed this found
+    /// no exception ready. Its pending scan finds the same until this record
+    /// is cleared.
+    idle: Option<usize>,
     /// Recompute every `verify`th skipped call and refuse any difference;
     /// zero never verifies. Debug builds verify every skip.
     verify: u32,
@@ -239,6 +262,7 @@ impl Settled {
             pass: false,
             armed: false,
             until: 0,
+            idle: None,
             verify: std::env::var("FUJIMOD_VERIFY_SETTLED")
                 .ok()
                 .and_then(|period| period.parse().ok())
@@ -252,6 +276,7 @@ impl Settled {
     fn clear(&mut self) {
         self.pass = false;
         self.armed = false;
+        self.idle = None;
     }
     /// Whether to recompute this skipped call.
     #[inline]
@@ -280,6 +305,29 @@ pub struct Board {
     #[allow(clippy::vec_box)]
     bindings: Vec<Box<Binding>>,
     hooks: Vec<(usize, HookId)>,
+    /// The owner of every hook the execution core holds or may hold for
+    /// itself, in construction order: the synchronization barrier, the
+    /// instruction observer and the board store hook. Which of them are
+    /// installed at an instant, and whether block execution replaced the
+    /// observer, is a host choice; snapshots and keyframes bind to this list
+    /// and to the hooks other owners installed (`hook_wiring`).
+    execution_hooks: Vec<usize>,
+    /// Per core, the synchronization barrier's hook.
+    barrier_hooks: Vec<Option<HookId>>,
+    /// Per core, the instruction observer's hook (`before`), when installed.
+    observer_hooks: Vec<Option<HookId>>,
+    /// Per core, the hooks that block execution installed.
+    block_hooks: Vec<Vec<HookId>>,
+    /// Per core, the board store hook (`written`) when it is always installed.
+    store_hooks: Vec<Option<HookId>>,
+    /// Host run control: M-profile processors may run in block execution.
+    /// `FUJIMOD_MPROFILE_INSTRUCTIONS` starts a board with it off.
+    block_execution: Cell<bool>,
+    /// Per core: its board store hook is installed only while it has work,
+    /// and the installed hook.
+    store_hooks_on_demand: Vec<Option<Option<HookId>>>,
+    /// Host-only: how often an on-demand store hook was installed.
+    store_hook_installs: Cell<u64>,
     /// Native MMIO maps as (core, address, bytes, physical base).
     mmio: Vec<(usize, u64, usize, u64)>,
     mmio_callback_counts: Rc<RefCell<Vec<u64>>>,
@@ -515,6 +563,8 @@ impl Board {
             exclusive,
             code_run: None,
             code_shadow: (0..n).map(|_| None).collect(),
+            blocks: (0..n).map(|_| None).collect(),
+            run_entries: vec![0; n],
             settled: Settled::new(),
             active_slice: None,
             parallel: None,
@@ -540,6 +590,16 @@ impl Board {
             state,
             bindings: vec![],
             hooks: vec![],
+            execution_hooks: vec![],
+            barrier_hooks: vec![None; n],
+            observer_hooks: vec![None; n],
+            block_hooks: vec![vec![]; n],
+            store_hooks: vec![None; n],
+            block_execution: Cell::new(
+                std::env::var_os("FUJIMOD_MPROFILE_INSTRUCTIONS").is_none(),
+            ),
+            store_hooks_on_demand: vec![None; n],
+            store_hook_installs: Cell::new(0),
             mmio: vec![],
             mmio_callback_counts,
             interactive_windows: Cell::new(0),
@@ -571,12 +631,10 @@ impl Board {
                     })?
                 };
                 board.hooks.push((core, hook));
+                board.execution_hooks.push(core);
+                board.barrier_hooks[core] = Some(hook);
             }
-            let batches = board.cpus[core].model() != fujimod_emulator_cpu::Model::CortexM4
-                && features.architectural_exits
-                && features.instruction_progress
-                && features.tighten_instruction_limit;
-            if !batches {
+            if observes_every_instruction(&*board.cpus[core]) {
                 let hook = unsafe {
                     board.cpus[core].install_hook(Hook::Instruction {
                         callback: before,
@@ -585,6 +643,8 @@ impl Board {
                     })?
                 };
                 board.hooks.push((core, hook));
+                board.execution_hooks.push(core);
+                board.observer_hooks[core] = Some(hook);
             }
             board.bindings.push(binding);
             if !board.cpus[core].features().shared_physical_maps
@@ -593,16 +653,28 @@ impl Board {
                         || c.model() == fujimod_emulator_cpu::Model::CortexM4
                 })
             {
-                let hook = unsafe {
-                    board.cpus[core].install_hook(Hook::Memory {
-                        callback: written,
-                        data,
-                        read: false,
-                        write: true,
-                        range: HookRange::All,
-                    })?
-                };
-                board.hooks.push((core, hook));
+                // Without an M-profile controller (no alias stores to
+                // detect), the board store hook only shows the processor's
+                // stores to a live logical exclusive reservation and to a
+                // write watch. An all-store hook sends every store of the
+                // processor through the engine's slow path, so it is
+                // installed on demand (`sync_store_hook`).
+                board.execution_hooks.push(core);
+                if board.cpus[core].model() != fujimod_emulator_cpu::Model::CortexM4 {
+                    board.store_hooks_on_demand[core] = Some(None);
+                } else {
+                    let hook = unsafe {
+                        board.cpus[core].install_hook(Hook::Memory {
+                            callback: written,
+                            data,
+                            read: false,
+                            write: true,
+                            range: HookRange::All,
+                        })?
+                    };
+                    board.hooks.push((core, hook));
+                    board.store_hooks[core] = Some(hook);
+                }
             }
         }
         board.state.borrow_mut().refresh_deadlines()?;
@@ -903,6 +975,7 @@ impl Board {
         let mut state = self.state.borrow_mut();
         state.mprofile[core] = Some(profile);
         state.code_shadow[core] = Some(Default::default());
+        state.blocks[core] = Some(Default::default());
         Ok(())
     }
     pub fn configure_aprofile(
@@ -1062,6 +1135,12 @@ impl Board {
         }
         self.state.borrow_mut().code_run = None;
         self.state.borrow_mut().clock_limit = until;
+        if self.execution_policy() != ExecutionPolicy::Exact {
+            // Concurrent windows do not pass the per-slice check.
+            for core in 0..self.cpus.len() {
+                self.sync_store_hook(core)?;
+            }
+        }
         self.idle_stopped.set(false);
         let mut idle_mark = None;
         let mut completed_slice = None;
@@ -1278,6 +1357,8 @@ impl Board {
             s.active_slice = Some(slice);
             let entered = s.instructions[core];
             drop(s);
+            self.sync_store_hook(core)?;
+            let blocks = self.sync_block_mode(core, budget as u64)?;
             let cpu = &self.cpus[core];
             // The exact budget ends at the first device/DMA/processor event
             // or runnable-peer turn; those boundaries end the stable window.
@@ -1287,6 +1368,9 @@ impl Board {
                 u8::try_from(core).unwrap_or(u8::MAX),
                 false,
             );
+            // Block execution has no engine counter: the board debits entries.
+            let mut limit = budget;
+            self.state.borrow_mut().run_entries[core] = 0;
             let mut result = cpu.run(Run {
                 begin: if cpu.model() == fujimod_emulator_cpu::Model::CortexM4
                     || matches!(
@@ -1301,34 +1385,45 @@ impl Board {
                 },
                 until: None,
                 watchdog_us: 0,
-                instructions: Some(budget),
+                instructions: (!blocks).then_some(limit),
             });
-            // The instruction observer found code a peer changed and stopped
-            // before entering it. Discard the translations and resume the
-            // same slice at once: the stop is host bookkeeping, not a
-            // scheduling boundary, so nothing else may run in between.
-            while result.is_ok() && self.code_resync(core)? {
-                let left = {
-                    let s = self.state.borrow();
-                    if s.error.is_some() {
-                        break;
-                    }
-                    (budget as u64).saturating_sub(s.instructions[core].saturating_sub(entered))
-                };
-                if left == 0 {
+            // An observer stopped the run for host bookkeeping: it found code
+            // changed behind the engine, or (block execution) it changed the
+            // PC. Resume the same slice at once: the stop is not a scheduling
+            // boundary, so nothing else may run in between.
+            while result.is_ok() {
+                let resync = self.code_resync(core)?;
+                let mut s = self.state.borrow_mut();
+                let resume = s.blocks[core]
+                    .as_mut()
+                    .is_some_and(|blocks| std::mem::take(&mut blocks.resume));
+                if !(resync || resume) || s.error.is_some() {
                     break;
                 }
+                if !blocks {
+                    // The engine counted every entry that reached the
+                    // observer, the stopped one too; that one runs again.
+                    let consumed = s.run_entries[core].saturating_sub(1);
+                    limit = limit.saturating_sub(consumed as usize);
+                    s.run_entries[core] = 0;
+                    if limit == 0 {
+                        break;
+                    }
+                }
+                drop(s);
                 result = cpu.run(Run {
                     begin: scalar(&**cpu, Register::Pc)? | 1,
                     until: None,
                     watchdog_us: 0,
-                    instructions: Some(left as usize),
+                    instructions: (!blocks).then_some(limit),
                 });
             }
             engine_guard.stop();
             engine_guard.set_instructions(cpu.instruction_progress().unwrap_or(0));
             let mut s = self.state.borrow_mut();
             s.active_slice = None;
+            // A block still pending when the run ends ran whole.
+            s.settle_block(core, None)?;
             s.end_code_slice(&**cpu, core);
             s.sync(&**cpu, core)?;
             if let Some(error) = s.error.take() {
@@ -1404,6 +1499,227 @@ impl Board {
                 self.slice_left.set(0);
             }
         }
+    }
+    /// Install or remove a processor's on-demand board store hook before it
+    /// runs. The hook has work while a logical exclusive reservation is live
+    /// (the processor's stores must reach the shared monitor), while a write
+    /// watch is armed, and outside exact execution, where peers run without
+    /// this check between their slices. Reservations change only while their
+    /// owner runs, so the state found here holds for the processor's slice.
+    /// Without the hook the monitor's write epoch does not count the
+    /// processor's stores; no reservation is live to observe them.
+    fn sync_store_hook(&mut self, core: usize) -> Result<(), String> {
+        let Some(installed) = self.store_hooks_on_demand[core] else {
+            return Ok(());
+        };
+        let wanted = {
+            let s = self.state.borrow();
+            s.execution_policy != ExecutionPolicy::Exact
+                || s.memory.watching_writes()
+                || s.exclusive
+                    .lock()
+                    .map_err(|_| "exclusive monitors poisoned")?
+                    .active()
+        };
+        match (wanted, installed) {
+            (true, None) => {
+                let data = (&*self.bindings[core] as *const Binding).cast_mut().cast();
+                // The binding box stays at this address until Board drops its CPU hooks.
+                let hook = unsafe {
+                    self.cpus[core].install_hook(Hook::Memory {
+                        callback: written,
+                        data,
+                        read: false,
+                        write: true,
+                        range: HookRange::All,
+                    })?
+                };
+                self.hooks.push((core, hook));
+                self.store_hooks_on_demand[core] = Some(Some(hook));
+                self.store_hook_installs.set(self.store_hook_installs.get() + 1);
+            }
+            (false, Some(hook)) => {
+                self.cpus[core].remove_hook(hook)?;
+                self.hooks.retain(|&(owner, other)| !(owner == core && other == hook));
+                self.store_hooks_on_demand[core] = Some(None);
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+    /// The hook wiring a snapshot or keyframe binds to: the execution core's
+    /// own hooks by owner, as constructed, then every hook another owner
+    /// installed (PC witnesses, write watches, discovery stubs) by identity.
+    /// It does not change when the execution core installs or removes its own
+    /// hooks between runs.
+    pub(super) fn hook_wiring(&self) -> Vec<(usize, Option<HookId>)> {
+        let own = |core: usize, hook: HookId| {
+            self.barrier_hooks[core] == Some(hook)
+                || self.observer_hooks[core] == Some(hook)
+                || self.store_hooks[core] == Some(hook)
+                || self.store_hooks_on_demand[core] == Some(Some(hook))
+                || self.block_hooks[core].contains(&hook)
+        };
+        self.execution_hooks
+            .iter()
+            .map(|&core| (core, None))
+            .chain(
+                self.hooks
+                    .iter()
+                    .filter(|&&(core, hook)| !own(core, hook))
+                    .map(|&(core, hook)| (core, Some(hook))),
+            )
+            .collect()
+    }
+    /// Allow or forbid block execution of M-profile processors. Both ways run
+    /// the same guest instructions; this exists to compare them.
+    pub fn set_block_execution(&self, on: bool) {
+        self.block_execution.set(on);
+    }
+    /// Choose, before a processor runs, between the per-instruction observer
+    /// and block execution (`mprofile_blocks`), and set the engine up for the
+    /// choice. Block execution needs exact execution, an M-profile
+    /// controller, and no observer the board's execution core did not install
+    /// itself (PC witnesses, instruction points, discovery stubs, write
+    /// watches): those read counters at their own instructions. Returns
+    /// whether the processor runs in block execution, with `budget` entries.
+    fn sync_block_mode(&mut self, core: usize, budget: u64) -> Result<bool, String> {
+        let (active, wanted) = {
+            let s = self.state.borrow();
+            let Some(blocks) = s.blocks[core].as_ref() else {
+                return Ok(false);
+            };
+            // The hooks the execution core keeps on this processor: its store
+            // hook, and the instruction observer or the block-mode hooks.
+            let own = 1 + if blocks.active {
+                self.block_hooks[core].len()
+            } else {
+                usize::from(self.observer_hooks[core].is_some())
+            };
+            let wanted = s.execution_policy == ExecutionPolicy::Exact
+                && self.block_execution.get()
+                && s.entry_points[core].is_empty()
+                && !s.memory.watching_writes()
+                && self.cpus[core].features().translation_filter
+                && self.cpus[core].hook_count() == Some(own);
+            (blocks.active, wanted)
+        };
+        if active != wanted {
+            let cpu = &self.cpus[core];
+            let data = (&*self.bindings[core] as *const Binding).cast_mut().cast();
+            if wanted {
+                if let Some(hook) = self.observer_hooks[core].take() {
+                    cpu.remove_hook(hook)?;
+                    self.hooks.retain(|&(owner, other)| !(owner == core && other == hook));
+                }
+                // The binding box stays at this address until Board drops its CPU hooks.
+                unsafe {
+                    // With a translation filter installed the engine restarts
+                    // a hooked store or device access as a block of its own.
+                    // The filter itself is not consulted for Thumb code.
+                    cpu.translation_hooks(Some(fujimod_emulator_cpu::TranslationHooks {
+                        classify: block_classify,
+                        restart: block_restarted,
+                        data,
+                    }))?;
+                    let hook = cpu.install_hook(Hook::Block {
+                        callback: block_entered,
+                        data,
+                        range: HookRange::All,
+                    })?;
+                    self.block_hooks[core].push(hook);
+                    // A device access must end its block. An unwatched hook
+                    // over the device pages makes the engine restart it as a
+                    // block of its own, for loads and (once the store hook
+                    // sees only watched pages) for stores.
+                    for &(owner, address, bytes, _) in &self.mmio {
+                        if owner == core && bytes != 0 {
+                            let hook = cpu.install_hook(Hook::Memory {
+                                callback: block_device_access,
+                                data: std::ptr::null_mut(),
+                                read: true,
+                                write: true,
+                                range: HookRange::Inclusive {
+                                    begin: address,
+                                    end: address + bytes as u64 - 1,
+                                },
+                            })?;
+                            self.block_hooks[core].push(hook);
+                        }
+                    }
+                }
+                self.hooks
+                    .extend(self.block_hooks[core].iter().map(|&hook| (core, hook)));
+            } else {
+                for hook in std::mem::take(&mut self.block_hooks[core]) {
+                    cpu.remove_hook(hook)?;
+                    self.hooks.retain(|&(owner, other)| !(owner == core && other == hook));
+                }
+                unsafe {
+                    cpu.translation_hooks(None)?;
+                    let hook = cpu.install_hook(Hook::Instruction {
+                        callback: before,
+                        data,
+                        range: HookRange::All,
+                    })?;
+                    self.hooks.push((core, hook));
+                    self.observer_hooks[core] = Some(hook);
+                }
+            }
+            cpu.invalidate_code(None)?;
+        }
+        // In block execution, let the store hook see only watched pages when
+        // nothing needs every store of this slice: no aliased view, no
+        // reservation whose granule this engine does not watch, and an
+        // engine with watched hooks. Otherwise, and outside block execution,
+        // the hook sees every store.
+        let fast = {
+            let s = self.state.borrow();
+            match s.mprofile[core].as_ref() {
+                Some(profile) => {
+                    wanted
+                        && self.store_hooks[core].is_some()
+                        && self.cpus[core].features().watched_stores
+                        && !profile.aliased()
+                        && !profile.monitors_need_every_store()?
+                }
+                None => false,
+            }
+        };
+        let was_fast = self.state.borrow().blocks[core].as_ref().unwrap().fast_stores;
+        let mut flushed = active != wanted;
+        if fast != was_fast {
+            let hook = self.store_hooks[core].ok_or("M-profile store hook is missing")?;
+            self.cpus[core].hook_watched(hook, fast)?;
+            let watching = self.state.borrow().blocks[core].as_ref().unwrap().watching;
+            if fast && !watching {
+                // The first store watches on this engine: every translation
+                // must pass an observer again, so that the page it came from
+                // is watched before it runs. Later, entered pages stay
+                // watched in every mode.
+                self.cpus[core].invalidate_code(None)?;
+                flushed = true;
+            }
+        }
+        let mut s = self.state.borrow_mut();
+        if flushed && let Some(shadow) = s.code_shadow[core].as_mut() {
+            shadow.discarded();
+            shadow.begin_slice();
+        }
+        if fast && let Some(profile) = s.mprofile[core].as_mut() {
+            profile.watch_reservations();
+        }
+        let blocks = s.blocks[core].as_mut().unwrap();
+        blocks.active = wanted;
+        blocks.fast_stores = fast;
+        blocks.watching |= fast;
+        if flushed {
+            blocks.last_watched = None;
+        }
+        blocks.room = budget;
+        blocks.pending = None;
+        blocks.resume = false;
+        Ok(wanted)
     }
     /// Discard a processor's translations when its instruction observer
     /// asked for it. Returns whether the stopped slice must resume.
@@ -1490,12 +1806,37 @@ impl Drop for Board {
             && let Ok(s) = self.state.try_borrow()
         {
             eprintln!(
-                "FUJIMOD execution counters: observer entries settled={} full={}",
-                s.settled.skips, s.settled.full
+                "FUJIMOD execution counters: observer entries settled={} full={} store-hook-installs={}",
+                s.settled.skips,
+                s.settled.full,
+                self.store_hook_installs.get()
             );
             for (core, shadow) in s.code_shadow.iter().enumerate() {
                 if let Some(shadow) = shadow {
                     eprintln!("FUJIMOD execution counters: CPU{core} code {}", shadow.counters());
+                }
+            }
+            for (core, blocks) in s.blocks.iter().enumerate() {
+                if let Some(blocks) = blocks {
+                    eprintln!(
+                        "FUJIMOD execution counters: CPU{core} blocks observed={} admitted-entries={} shortened={} fast-stores={} watched-pages={}",
+                        blocks.observed,
+                        blocks.admitted,
+                        blocks.shortened,
+                        blocks.fast_stores,
+                        blocks.watched.len()
+                    );
+                }
+            }
+            for (core, cpu) in self.cpus.iter().enumerate() {
+                if let Ok(counters) = cpu.exit_counters() {
+                    let row = counters
+                        .iter()
+                        .filter(|(_, n)| **n != 0)
+                        .map(|(name, n)| format!("{name}={n}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    eprintln!("FUJIMOD execution counters: CPU{core} engine {row}");
                 }
             }
         }
@@ -1585,6 +1926,45 @@ impl State {
         }
         Ok(())
     }
+    /// Account the admitted block of a processor in block execution: all of
+    /// it, or the `entered` entries of it when the engine restarted an
+    /// instruction. The unentered rest returns to the run's budget.
+    fn settle_block(&mut self, core: usize, entered: Option<u64>) -> Result<(), String> {
+        let Some(blocks) = self.blocks[core].as_mut() else {
+            return Ok(());
+        };
+        let Some((_, _, entries, _)) = blocks.pending.take() else {
+            return Ok(());
+        };
+        let entered = entered.unwrap_or(entries).min(entries);
+        blocks.room += entries - entered;
+        blocks.admitted += entered;
+        self.account(core, entered)?;
+        self.instructions[core] = self.instructions[core]
+            .checked_add(entered)
+            .ok_or("instruction counter overflow")?;
+        Ok(())
+    }
+    /// The Thumb code of a block, from host memory when the code shadow has
+    /// the page, else through the engine.
+    fn block_code<'a>(
+        &'a self,
+        cpu: &dyn Cpu,
+        core: usize,
+        address: u64,
+        bytes: usize,
+        buffer: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8], String> {
+        if let Some(code) = self.code_shadow[core]
+            .as_ref()
+            .and_then(|shadow| shadow.code(address, bytes))
+        {
+            return Ok(code);
+        }
+        buffer.resize(bytes, 0);
+        cpu.read_memory(address, buffer)?;
+        Ok(buffer)
+    }
     /// Whether a whole page at `address` is checked shared RAM of an
     /// M-profile processor.
     fn code_page_checked(profile: &Option<mprofile::Profile>, address: u64) -> bool {
@@ -1592,8 +1972,34 @@ impl State {
             .as_ref()
             .is_some_and(|profile| profile.physical(address, 4096).is_ok())
     }
+    /// Once store watches exist on a processor's engine, the engine detects
+    /// stores into translated code only on watched pages. Watch the page an
+    /// instruction is entered from, and the next (a translation may end
+    /// there), before it runs.
+    #[inline]
+    fn watch_code(&mut self, cpu: &dyn Cpu, core: usize, pc: u64) -> Result<(), String> {
+        let Some(blocks) = self.blocks[core].as_mut().filter(|blocks| blocks.watching) else {
+            return Ok(());
+        };
+        let page = pc & !0xfff;
+        if blocks.last_watched == Some(page) {
+            return Ok(());
+        }
+        blocks.last_watched = Some(page);
+        for page in [Some(page), page.checked_add(0x1000)].into_iter().flatten() {
+            if page <= u32::MAX as u64 - 0xfff && blocks.watched.insert(page) {
+                cpu.watch_stores(page, 0x1000)?;
+            }
+        }
+        Ok(())
+    }
     /// Close a slice of the code shadow at the processor's stop PC.
     fn end_code_slice(&mut self, cpu: &dyn Cpu, core: usize) {
+        if let Ok(pc) = scalar(cpu, Register::Pc)
+            && let Err(error) = self.watch_code(cpu, core, pc & !1)
+        {
+            self.fail(error);
+        }
         let Self {
             code_shadow,
             code_run,
@@ -1616,6 +2022,7 @@ impl State {
     /// Prove the code about to be entered at `pc`, or stop the slice so the
     /// owner discards the translations first. Returns whether to stop.
     fn enter_code(&mut self, cpu: &dyn Cpu, core: usize, pc: u64) -> Result<bool, String> {
+        self.watch_code(cpu, core, pc)?;
         let Self {
             code_shadow,
             mprofile,
@@ -1624,6 +2031,13 @@ impl State {
         let Some(shadow) = code_shadow[core].as_mut() else {
             return Ok(false);
         };
+        if shadow.changed() {
+            // A store of this processor found its page changed behind the
+            // engine. Nothing stale may be entered.
+            shadow.request_resync();
+            cpu.stop()?;
+            return Ok(true);
+        }
         let profile = &mprofile[core];
         match shadow.touch(cpu, pc & !1, |address| Self::code_page_checked(profile, address)) {
             code_shadow::Touch::Proven => Ok(false),
@@ -2033,6 +2447,17 @@ impl State {
         self.settled.armed = until > now;
         Ok(())
     }
+    /// Recompute the pending scan a settled observer skipped for an idle
+    /// M-profile controller and refuse a ready exception.
+    fn verify_idle(&mut self, core: usize, idle: bool) -> Result<(), String> {
+        if idle
+            && let Some(p) = self.mprofile[core].as_mut()
+            && p.pending()
+        {
+            return Err("settled M-profile controller has a ready exception".into());
+        }
+        Ok(())
+    }
     /// Recompute what a settled observer skipped and refuse any difference.
     fn verify_settled(&mut self, cpus: &[Rc<dyn Cpu>], pins: bool) -> Result<(), String> {
         let saved = (self.settled.armed, self.settled.until);
@@ -2095,6 +2520,9 @@ impl State {
             return Err("MMIO requires committed memory decoding".into());
         }
         self.settled.clear();
+        // Block execution: a device access is the last instruction of its
+        // block, so the whole block has been entered.
+        self.settle_block(core, None)?;
         self.sync(&*cpus[core], core)?;
         self.due(cpus)?;
         let pc = scalar(&*cpus[core], Register::Pc)?;
@@ -2399,6 +2827,7 @@ unsafe fn before(pc: u64, _: u32, data: *mut c_void) {
     let result = (|| {
         let cpu = &*cpus[b.core];
         let mut s = b.state.borrow_mut();
+        s.run_entries[b.core] += 1;
         s.sync(cpu, b.core)?;
         s.due(&cpus)?;
         if s.decoders.pending() {
@@ -2466,8 +2895,11 @@ unsafe fn before(pc: u64, _: u32, data: *mut c_void) {
         let fetched = s.code_shadow[b.core]
             .as_ref()
             .and_then(|shadow| shadow.fetch(pc));
+        let idle = settled && s.settled.idle == Some(b.core);
         if let Some(p) = &mut s.mprofile[b.core] {
-            let entry = p.before(cpu, pc, fetched)?;
+            let entry = p.before(cpu, pc, fetched, idle)?;
+            let ready = p.ready();
+            p.take_stopped();
             if p.take_alias_write() {
                 s.code_run = None;
             }
@@ -2485,11 +2917,15 @@ unsafe fn before(pc: u64, _: u32, data: *mut c_void) {
             if settled && execute {
                 if verify {
                     s.verify_settled(&cpus, false)?;
+                    s.verify_idle(b.core, idle)?;
                 }
             } else {
                 s.refresh_processors()?;
                 if execute {
                     s.arm_settled()?;
+                    if s.settled.armed && !ready {
+                        s.settled.idle = Some(b.core);
+                    }
                 }
             }
         }
@@ -2504,6 +2940,212 @@ unsafe fn before(pc: u64, _: u32, data: *mut c_void) {
     if let Err(e) = result {
         b.state.borrow_mut().fail(e);
         let _ = cpus[b.core].stop();
+    }
+}
+/// Block execution's translation filter. The engine does not consult it for
+/// Thumb code; its presence makes hooked accesses restart as their own block.
+unsafe fn block_classify(_: *mut c_void, _: u64, _: u32) -> fujimod_emulator_cpu::Translation {
+    fujimod_emulator_cpu::Translation {
+        instruction: fujimod_emulator_cpu::InstructionDisposition::Execute,
+        observe_block: true,
+    }
+}
+/// Covers device pages so that an access to one ends its block.
+unsafe fn block_device_access(_: fujimod_emulator_cpu::Access, _: u64, _: i32, _: i64, _: *mut c_void) {}
+/// The engine is about to redo the instruction at `pc` as a block of its own:
+/// of the admitted block, only the instructions before it were entered.
+unsafe fn block_restarted(data: *mut c_void, pc: u64) {
+    let b = unsafe { &*data.cast::<Binding>() };
+    let Some(cpus) = b.cpus.upgrade() else {
+        return;
+    };
+    let result = (|| {
+        let mut s = b.state.borrow_mut();
+        let Some((address, bytes, _, _)) =
+            s.blocks[b.core].as_ref().and_then(|blocks| blocks.pending)
+        else {
+            return Ok(());
+        };
+        let entered = match pc.checked_sub(address) {
+            Some(0) => 0,
+            Some(prefix) if prefix < u64::from(bytes) => {
+                let mut buffer = Vec::new();
+                let code = s.block_code(&*cpus[b.core], b.core, address, prefix as usize, &mut buffer)?;
+                mprofile_blocks::scan(code)?.entries
+            }
+            _ => return Err("restarted instruction is outside its block".into()),
+        };
+        s.settle_block(b.core, Some(entered))
+    })();
+    if let Err(e) = result {
+        b.state.borrow_mut().fail(e);
+        let _ = cpus[b.core].stop();
+    }
+}
+/// Block execution's observer: the instruction observer's work for the first
+/// instruction of a block, then the admission of the instructions that may
+/// follow it unobserved (`mprofile_blocks`).
+unsafe fn block_entered(block: fujimod_emulator_cpu::Block, data: *mut c_void) {
+    let b = unsafe { &*data.cast::<Binding>() };
+    let Some(cpus) = b.cpus.upgrade() else {
+        return;
+    };
+    let core = b.core;
+    let result = (|| {
+        let cpu = &*cpus[core];
+        let mut s = b.state.borrow_mut();
+        let pc = block.address;
+        let bytes = block.bytes & 0x3fff_ffff;
+        // The block before this one ran whole.
+        s.settle_block(core, None)?;
+        let room = s.blocks[core].as_ref().map_or(0, |blocks| blocks.room);
+        if room == 0 {
+            // The engine's counter stops before the observer of the first
+            // entry beyond the budget.
+            cpu.stop()?;
+            return Ok(());
+        }
+        s.due(&cpus)?;
+        if s.decoders.pending() {
+            cpu.stop()?;
+            return Ok(());
+        }
+        if s.enter_code(cpu, core, pc)? {
+            return Ok(());
+        }
+        // How many entries may follow without another observation. Nothing
+        // above or here changes state when repeated, so a shortened block
+        // can come back through this point.
+        let settled = s.settled();
+        let scan = {
+            let mut buffer = Vec::new();
+            mprofile_blocks::scan(s.block_code(cpu, core, pc, bytes as usize, &mut buffer)?)?
+        };
+        let (entries, last) = (scan.entries, scan.last);
+        // A `bx lr` that ends the admission is an ordinary branch when LR is
+        // not an exception return value now and the block leaves LR alone:
+        // the controller would let it execute. BX ends its block.
+        let unit = if scan.returns_through_lr
+            && scan.unit + 1 == entries
+            && scalar(
+                cpu,
+                Register::Arm32(fujimod_emulator_cpu::arm::Register::R(14)),
+            )? < 0xffff_ffe0
+        {
+            entries
+        } else {
+            scan.unit
+        };
+        let limit = if settled {
+            // Until the next device deadline, the end of the run window, the
+            // next generic-timer output change and the peer's turn.
+            let until = s.clock_limit.unwrap_or(u64::MAX).min(s.settled.until);
+            unit.min(room)
+                .min(s.timeline.processor_budget(core, u64::MAX, Some(until))?)
+                .min(s.scheduler_room(core))
+        } else {
+            // The pin push and deadline refresh below are not yet known to be
+            // a fixed point: the next instruction needs them again.
+            1
+        };
+        if limit == 0 {
+            // No entry fits before the run window ends or the peer's turn.
+            cpu.stop()?;
+            return Ok(());
+        }
+        if limit < entries {
+            if let Some(blocks) = s.blocks[core].as_mut() {
+                blocks.shortened += 1;
+            }
+            return cpu.retry_block(limit as u32);
+        }
+        // From here on, once per entry, in the instruction observer's order.
+        let verify = settled && s.settled.verifies();
+        if settled {
+            s.settled.skips += 1;
+            if verify {
+                s.verify_settled(&cpus, true)?;
+            }
+        } else {
+            s.settled.full += 1;
+            if s.push_pins(&cpus)? {
+                cpu.stop()?;
+                return Ok(());
+            }
+        }
+        if s.error.is_some() || s.scheduler_room(core) == 0 || s.code_run != Some(core) {
+            cpu.stop()?;
+            return Ok(());
+        }
+        // This entry reaches the controller: the engine's counter would have
+        // counted it.
+        let blocks = s.blocks[core].as_mut().ok_or("block execution without its state")?;
+        blocks.room -= 1;
+        blocks.observed += 1;
+        let fetched = s.code_shadow[core]
+            .as_ref()
+            .and_then(|shadow| shadow.fetch(pc));
+        let idle = settled && s.settled.idle == Some(core);
+        let p = s.mprofile[core]
+            .as_mut()
+            .ok_or("block execution without an M-profile controller")?;
+        let entry = p.before(cpu, pc, fetched, idle)?;
+        let ready = p.ready();
+        // An exclusive instruction stops the engine as a scheduling boundary;
+        // other emulated instructions only move the PC.
+        let stopped = p.take_stopped();
+        if p.take_alias_write() {
+            s.code_run = None;
+        }
+        let execute = matches!(entry, mprofile::Entry::Execute);
+        if !execute {
+            s.settled.clear();
+        }
+        match entry {
+            mprofile::Entry::Redirect => {
+                // The controller entered an exception: resume at its PC.
+                s.blocks[core].as_mut().unwrap().resume = true;
+                return cpu.stop();
+            }
+            mprofile::Entry::Emulated => (),
+            mprofile::Entry::Wait => s.waiting[core] = true,
+            mprofile::Entry::Execute => (),
+        }
+        if settled && execute {
+            if verify {
+                s.verify_settled(&cpus, false)?;
+                s.verify_idle(core, idle)?;
+            }
+        } else {
+            s.refresh_processors()?;
+            if execute {
+                s.arm_settled()?;
+                if s.settled.armed && !ready {
+                    s.settled.idle = Some(core);
+                }
+            }
+        }
+        if !execute {
+            // The controller performed the instruction (or waits after it):
+            // one entry, and the engine continues at the PC it left.
+            s.account(core, 1)?;
+            s.instructions[core] = s.instructions[core]
+                .checked_add(1)
+                .ok_or("instruction counter overflow")?;
+            if matches!(entry, mprofile::Entry::Emulated) && !stopped {
+                s.blocks[core].as_mut().unwrap().resume = true;
+            }
+            return cpu.stop();
+        }
+        // Admit the block: its first entry is already debited.
+        let blocks = s.blocks[core].as_mut().unwrap();
+        blocks.room -= entries - 1;
+        blocks.pending = Some((pc, bytes, entries, pc + last));
+        Ok::<(), String>(())
+    })();
+    if let Err(e) = result {
+        b.state.borrow_mut().fail(e);
+        let _ = cpus[core].stop();
     }
 }
 fn notify_memory(
@@ -2547,6 +3189,19 @@ unsafe fn written(
         usize::try_from(size)
             .map_err(|_| "invalid memory-store width".into())
             .and_then(|size| {
+                // Block execution. While the hook sees every store, a hooked
+                // store is the last instruction of its block. Once it sees
+                // only watched pages, a hooked store may be inside a block:
+                // have the engine redo it as a block of its own, and do this
+                // hook's work then. The restart accounts the entered prefix.
+                if let Some(blocks) = state.blocks[b.core].as_ref()
+                    && blocks.fast_stores
+                    && let Some((_, _, _, last)) = blocks.pending
+                    && scalar(&*cpus[b.core], Register::Pc)? & !1 != last
+                {
+                    return cpus[b.core].request_restart();
+                }
+                state.settle_block(b.core, None)?;
                 let address =
                     cpus[b.core].translate(address, fujimod_emulator_cpu::Access::Write)?;
                 if state.memory.watching_writes() {
@@ -2557,6 +3212,11 @@ unsafe fn written(
                     .is_some_and(|p| p.writes_an_alias(address, size))
                 {
                     state.code_run = None;
+                }
+                if state.execution_policy == ExecutionPolicy::Exact
+                    && let Some(shadow) = state.code_shadow[b.core].as_mut()
+                {
+                    shadow.stored(&*cpus[b.core], address, size);
                 }
                 notify_memory(
                     &cpus,
