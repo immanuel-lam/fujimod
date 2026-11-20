@@ -287,6 +287,62 @@
     "lcd_touchscreen": {
       "label": "Screen",
       "text": "Screen"
+    },
+    "dial_lock_release": {
+      "label": "Dial lock",
+      "text": "Dial lock"
+    },
+    "sensitivity_dial": {
+      "label": "Sensitivity",
+      "text": "ISO"
+    },
+    "still_movie_mode_dial": {
+      "label": "Still / movie",
+      "text": "STILL/MOVIE"
+    },
+    "af_on_button": {
+      "label": "AF-ON",
+      "text": "AF-ON"
+    },
+    "ael_button": {
+      "label": "AE-L",
+      "text": "AE-L"
+    },
+    "focus_stick": {
+      "label": "Focus stick",
+      "text": "Focus stick"
+    },
+    "focus_stick.up": {
+      "label": "Focus stick up",
+      "text": "Focus stick up"
+    },
+    "focus_stick.down": {
+      "label": "Focus stick down",
+      "text": "Focus stick down"
+    },
+    "focus_stick.left": {
+      "label": "Focus stick left",
+      "text": "Focus stick left"
+    },
+    "focus_stick.right": {
+      "label": "Focus stick right",
+      "text": "Focus stick right"
+    },
+    "focus_stick.press": {
+      "label": "Focus stick press",
+      "text": "Focus stick press"
+    },
+    "memory_card_slot_cover_latch": {
+      "label": "Card slot cover",
+      "text": "Card slot cover"
+    },
+    "disp_back_bluetooth_button": {
+      "label": "DISP / BACK",
+      "text": "DISP/BACK"
+    },
+    "lcd_tilt_lock_release": {
+      "label": "Screen tilt lock",
+      "text": "Screen tilt lock"
     }
   },
   "icons": {
