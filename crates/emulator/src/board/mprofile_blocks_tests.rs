@@ -37,10 +37,18 @@ struct Outcome {
     memory: Vec<u8>,
     observed: u64,
     fast_stores: bool,
+    /// Entries the engine entered in block chains.
+    chained: u64,
+    /// Hooked stores inside a block that needed no restart.
+    in_place: u64,
 }
 
 /// The program and its storing peer on a fresh board.
 fn board(blocks: bool) -> Board {
+    board_with(blocks, &PROGRAM)
+}
+
+fn board_with(blocks: bool, program: &[u16]) -> Board {
     use factory::*;
     let arm32 = |r| Register::Arm32(fujimod_emulator_cpu::arm::Register::R(r));
     let graph = Graph {
@@ -96,7 +104,7 @@ fn board(blocks: bool) -> Board {
     board
         .write_physical(
             0x10100,
-            &PROGRAM.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>(),
+            &program.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>(),
         )
         .unwrap();
     // The peer: add r0,r0,#1; str r0,[r1]; b .-8
@@ -107,7 +115,12 @@ fn board(blocks: bool) -> Board {
 }
 
 fn run(quantum: usize, blocks: bool, until: u64, windows: &[u64]) -> Outcome {
+    run_chained(quantum, blocks, true, until, windows)
+}
+
+fn run_chained(quantum: usize, blocks: bool, chains: bool, until: u64, windows: &[u64]) -> Outcome {
     let mut board = board(blocks);
+    board.set_block_chains(chains);
     for &window in windows {
         board.run_until(window, quantum).unwrap();
     }
@@ -123,15 +136,24 @@ fn outcome(board: &Board) -> Outcome {
     let mut memory = vec![0; 0x24];
     board.read_physical(0x12000, &mut memory[..0x20]).unwrap();
     board.read_physical(0x10800, &mut memory[0x20..]).unwrap();
-    let (observed, fast_stores) = board.state.borrow().blocks[0]
+    let (observed, fast_stores, chained, in_place) = board.state.borrow().blocks[0]
         .as_ref()
-        .map_or((0, false), |blocks| (blocks.observed, blocks.fast_stores));
+        .map_or((0, false, 0, 0), |blocks| {
+            (
+                blocks.observed,
+                blocks.fast_stores,
+                blocks.chain.as_ref().map_or(0, |chain| chain.entries),
+                blocks.chain.as_ref().map_or(0, |chain| chain.in_place),
+            )
+        });
     Outcome {
         state: board.state(),
         registers,
         memory,
         observed,
         fast_stores,
+        chained,
+        in_place,
     }
 }
 
@@ -156,6 +178,154 @@ fn block_execution_equals_the_instruction_observer() {
             assert!((rounds - 1..=rounds).contains(&u64::from(reference.memory[0x20])));
             assert!(reference.registers[10] > 0, "quantum {quantum}: STREX never failed");
         }
+    }
+}
+
+/// Block chains let the engine enter admitted blocks without the observer.
+/// The registers, the memory and the whole board state, with every entry
+/// count, device instant and exception, equal those of the observer that
+/// sees every block, and of the instruction observer.
+#[test]
+fn block_chains_equal_the_observer_of_every_block() {
+    let (mut chained, mut in_place) = (0, 0);
+    for quantum in [1, 2, 3, 7, 16, 64, 100, 1000] {
+        for (until, windows) in [(2500, &[][..]), (4000, &[211, 212, 900, 2333][..]), (20_000, &[][..])] {
+            let reference = run_chained(quantum, false, false, until, windows);
+            let every = run_chained(quantum, true, false, until, windows);
+            let chains = run_chained(quantum, true, true, until, windows);
+            assert_eq!(every.chained, 0);
+            for (name, outcome) in [("every block", &every), ("chains", &chains)] {
+                assert_eq!(outcome.registers, reference.registers, "{name}: quantum {quantum} until {until}");
+                assert_eq!(outcome.memory, reference.memory, "{name}: quantum {quantum} until {until}");
+                assert_eq!(outcome.state, reference.state, "{name}: quantum {quantum} until {until}");
+            }
+            // Every chained entry is one the observer did not see.
+            assert!(chains.observed <= every.observed, "quantum {quantum} until {until}");
+            assert_eq!(chains.chained == 0, chains.observed == every.observed);
+            chained += chains.chained;
+            in_place += chains.in_place;
+        }
+    }
+    assert!(chained > 0, "no block was ever chained");
+    // The program stores into the page it runs from: some of those stores
+    // stayed inside their block.
+    assert!(in_place > 0, "no hooked store ever stayed in its block");
+}
+
+/// A watched store inside an IT block, in the middle of a block that then
+/// changes the flags and branches. The store hook returns into the block
+/// (the store stays in place under block chains), and the instruction at
+/// the branch target must run whatever the flags are: the IT block is over.
+#[test]
+fn a_store_in_an_it_block_stays_in_its_block_under_block_chains() {
+    const IT_STORE: [u16; 15] = [
+        0x2500, // movs r5,#0
+        0xf640, 0x0100, 0xf2c0, 0x0101, // r1 = 0x10800, in the code page
+        0x3501, // loop: adds r5,#1
+        0x4280, 0xbf08, 0x600d, // cmp r0,r0; it eq; streq r5,[r1]
+        0x2401, 0xe7ff, // movs r4,#1; b next
+        0x3605, // next: adds r6,#5
+        0x2d28, 0xd1f6, // cmp r5,#40; bne loop
+        0xe7fe, // b .
+    ];
+    let mut in_place = 0;
+    for quantum in [1, 3, 16, 100, 1000] {
+        let mut outcomes = vec![];
+        for (blocks, chains) in [(false, false), (true, false), (true, true)] {
+            let mut board = board_with(blocks, &IT_STORE);
+            board.set_block_chains(chains);
+            board.run_until(3000, quantum).unwrap();
+            outcomes.push(outcome(&board));
+        }
+        for outcome in &outcomes {
+            assert_eq!(outcome.registers[5], 40, "quantum {quantum}");
+            assert_eq!(outcome.registers[6], 200, "quantum {quantum}");
+            assert_eq!(outcome.registers[13], 0x1011c, "quantum {quantum}");
+            assert_eq!(outcome.registers, outcomes[0].registers, "quantum {quantum}");
+            assert_eq!(outcome.state, outcomes[0].state, "quantum {quantum}");
+        }
+        assert_eq!(outcomes[1].in_place, 0);
+        in_place += outcomes[2].in_place;
+    }
+    assert!(in_place > 0, "no store stayed in its block");
+}
+
+/// Stores into pages nobody watches, in the middle of a block. The first
+/// store into each page misses the engine's TLB, takes the slow path and
+/// reaches the store hook although the hook sees only watched pages. Without
+/// block chains it restarts as a block of its own, comes back on the fast
+/// path, and the hook never does its work for it. Block chains must not
+/// leave such a store in its block: the exclusive monitors, which count the
+/// stores the hook sees, would differ, and with them every checkpoint.
+#[test]
+fn a_store_the_hook_sees_by_chance_is_not_left_in_its_block() {
+    const STORES: [u16; 15] = [
+        0x2500, // movs r5,#0
+        0xf245, 0x0100, 0xf2c0, 0x0101, // r1 = 0x15000
+        0x3501, 0x3601, // loop: adds r5,#1; adds r6,#1
+        0x600d, // str r5,[r1]
+        0x3601, 0x3601, // adds r6,#1 twice
+        0xf501, 0x5180, // add.w r1,r1,#0x1000
+        0x2d03, 0xd1f6, // cmp r5,#3; bne loop
+        0xe7fe, // b .
+    ];
+    for quantum in [3, 16, 100, 1000] {
+        let mut outcomes = vec![];
+        for chains in [false, true] {
+            let mut board = board_with(true, &STORES);
+            board.set_block_chains(chains);
+            board.run_until(3000, quantum).unwrap();
+            let mut pages = vec![0; 12];
+            for (page, word) in pages.chunks_mut(4).enumerate() {
+                board.read_physical(0x15000 + 0x1000 * page as u64, word).unwrap();
+            }
+            assert_eq!(pages, [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0], "quantum {quantum}");
+            let monitors = board.state.borrow().exclusive.lock().unwrap().export_checkpoint();
+            outcomes.push((outcome(&board), monitors));
+        }
+        assert!(outcomes[1].0.chained > 0, "quantum {quantum}");
+        assert_eq!(outcomes[1].0.registers, outcomes[0].0.registers, "quantum {quantum}");
+        assert_eq!(outcomes[1].0.state, outcomes[0].0.state, "quantum {quantum}");
+        assert_eq!(outcomes[1].1, outcomes[0].1, "quantum {quantum}: exclusive monitors");
+    }
+}
+
+/// A store that rewrites a later instruction of the block it is in. The
+/// processor has no instruction cache: the new instruction runs in the same
+/// round. Such a store must end its block, with or without block chains.
+///
+/// 41 rounds; each writes `adds r6,#2` (odd rounds) or `adds r6,#1` (even
+/// rounds) over the third of three `adds r6,#1` that follow the store in
+/// straight line: R6 ends at 21 * 4 + 20 * 3. A block that ran on with the
+/// instruction it was translated from would end one short.
+#[test]
+fn a_store_into_its_own_block_ends_the_block_under_block_chains() {
+    const REWRITE: [u16; 16] = [
+        0x2500, // movs r5,#0
+        0x3501, // loop: adds r5,#1
+        0xa104, // adr r1,patch
+        0x07ea, 0xbf0c, 0xf243, 0x6201, 0xf243, 0x6202, // r2 = adds r6,#1 or #2
+        0x800a, // strh r2,[r1]
+        0x3601, 0x3601, // adds r6,#1 twice
+        0x3601, // patch: adds r6,#1 or #2
+        0x2d29, 0xd1f1, // cmp r5,#41; bne loop
+        0xe7fe, // b .
+    ];
+    for quantum in [1, 3, 16, 100, 1000] {
+        let mut outcomes = vec![];
+        for chains in [false, true] {
+            let mut board = board_with(true, &REWRITE);
+            board.set_block_chains(chains);
+            board.run_until(3000, quantum).unwrap();
+            outcomes.push(outcome(&board));
+        }
+        for outcome in &outcomes {
+            assert_eq!(outcome.registers[5], 41, "quantum {quantum}");
+            assert_eq!(outcome.registers[6], 21 * 4 + 20 * 3, "quantum {quantum}");
+            assert_eq!(outcome.registers[13], 0x1011e, "quantum {quantum}");
+        }
+        assert_eq!(outcomes[1].registers, outcomes[0].registers, "quantum {quantum}");
+        assert_eq!(outcomes[1].state, outcomes[0].state, "quantum {quantum}");
     }
 }
 

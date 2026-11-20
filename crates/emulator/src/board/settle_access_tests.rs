@@ -182,7 +182,13 @@ fn run_with(quantum: usize, blocks: bool, windows: &[u64], stable: bool, fast_fo
     Outcome {
         state: board.state(),
         registers,
-        skips: s.settled.skips,
+        // An entry of a block chain is an entry the settled observer
+        // admitted without being called (`mprofile_blocks::Chain`).
+        skips: s.settled.skips
+            + s.blocks[0]
+                .as_ref()
+                .and_then(|blocks| blocks.chain.as_ref())
+                .map_or(0, |chain| chain.entries),
         full: s.settled.full,
         accesses: board.mmio_callback_counts.borrow()[0],
         served: probe.lock().unwrap().count,

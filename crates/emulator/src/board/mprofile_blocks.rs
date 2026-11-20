@@ -67,6 +67,149 @@ pub(super) struct Blocks {
     pub shortened_by: [u64; 5],
     /// Scans of blocks entered before (`ScanCache`).
     pub scans: ScanCache,
+    /// Block chains (`Chain`), when the engine has them and they are on.
+    pub chain: Option<Chain>,
+}
+
+/// Block chains: one admission covers several translated blocks.
+///
+/// The observer of a block entry does, in a settled state with an idle
+/// controller and a block whose instructions it need not see, nothing but
+/// bookkeeping: it accounts the block before, finds no device event due,
+/// finds the code page proven, and admits the whole block. When it has just
+/// admitted a block in that state, the same holds for every block entered
+/// next, as long as
+/// - no callback of this processor ran in between (a store hook, a device
+///   access and a restart each end the chain: they call `State::take_chain`
+///   through `settle_block` before anything else);
+/// - the entry budget that bounded the admission is not used up (the next
+///   device event, the settled window, the run's budget, the peer's turn);
+/// - the block is `Scan::plain` and was observed before as this very
+///   translation, so its code page is watched and its bytes are known;
+/// - the page of the block was touched in this slice (`CodeShadow`).
+///
+/// The engine tests exactly that in translated code (`BlockChain`). The
+/// observer admits a plain translation with its entry count as the weight
+/// and its page as the key, opens the guard of a page when it has touched
+/// it in this slice, and after an admission in the state above grants the
+/// rest of the entry budget. The engine then enters admitted blocks without
+/// the block hook. At the next callback the observer learns how many entries
+/// the chain used and which block it entered last, accounts the entries of
+/// the blocks that ran whole, and makes the last block the pending one, as
+/// if it had observed each entry.
+///
+/// Host-only: the entry counts, the instants of device events and every
+/// stop are those of the observer that sees every block.
+pub(super) struct Chain {
+    /// The engine's record: budget, last tag, page guards.
+    pub record: std::ptr::NonNull<fujimod_emulator_cpu::BlockChain>,
+    /// The budget granted and not yet taken back; 0 when none is out.
+    pub granted: u64,
+    /// The guard slots opened in this slice.
+    pub open: u64,
+    /// Host-only counters: grants, chained entries, and admissions.
+    pub grants: u64,
+    pub entries: u64,
+    pub admissions: u64,
+    /// Host-only: hooked stores inside a block that needed no restart.
+    pub in_place: u64,
+    /// Host-only: observer entries by why the engine called. With a grant
+    /// out: a block that is not plain, a plain one. Without: after a
+    /// callback that could not grant (not settled, controller not idle,
+    /// other), and after an observer entry that did not admit or grant.
+    pub seen: [u64; 7],
+    /// Whether a grant was out when the last `take` ran.
+    pub had_grant: bool,
+    /// Why the last callback did not grant (index into `seen`), if it did not.
+    pub refused: Option<usize>,
+}
+impl Chain {
+    pub fn new(record: std::ptr::NonNull<fujimod_emulator_cpu::BlockChain>) -> Self {
+        Self {
+            record,
+            granted: 0,
+            open: 0,
+            grants: 0,
+            entries: 0,
+            admissions: 0,
+            in_place: 0,
+            seen: [0; 7],
+            had_grant: false,
+            refused: None,
+        }
+    }
+    /// The guard value of a page: never 0 (closed) and never `u32::MAX`.
+    #[inline]
+    pub fn key(pc: u64) -> u32 {
+        (pc >> 12) as u32 + 1
+    }
+    /// What a chained entry of a block leaves behind: its address, bytes,
+    /// the offset of its last instruction and its entries. `None` when the
+    /// block does not fit.
+    #[inline]
+    pub fn tag(pc: u64, bytes: u32, last: u64, entries: u64) -> Option<u64> {
+        (pc <= u64::from(u32::MAX) && bytes < 0x1000 && last < 0x1000 && (1..0x100).contains(&entries))
+            .then(|| pc | u64::from(bytes) << 32 | last << 44 | entries << 56)
+    }
+    /// The pending block a tag describes.
+    #[inline]
+    pub fn pending(tag: u64) -> (u64, u32, u64, u64) {
+        let pc = tag & 0xffff_ffff;
+        (pc, (tag >> 32) as u32 & 0xfff, tag >> 56, pc + ((tag >> 44) & 0xfff))
+    }
+    /// Open the guard of the page of `pc`: the page was touched in this
+    /// slice.
+    #[inline]
+    pub fn open(&mut self, pc: u64) {
+        let slot = fujimod_emulator_cpu::BlockChain::slot(pc);
+        // SAFETY: the record lives as long as the engine; execution is
+        // serialized with this access.
+        unsafe { (*self.record.as_ptr()).guards[slot] = Self::key(pc) };
+        self.open |= 1 << slot;
+    }
+    /// Whether the guard of the page of `pc` is open for that page.
+    #[inline]
+    pub fn is_open(&self, pc: u64) -> bool {
+        let slot = fujimod_emulator_cpu::BlockChain::slot(pc);
+        // SAFETY: as in `open`.
+        unsafe { (*self.record.as_ptr()).guards[slot] == Self::key(pc) }
+    }
+    /// Close every guard and take back any grant: a slice begins, or the
+    /// translations were discarded.
+    pub fn close(&mut self) {
+        // SAFETY: as in `open`.
+        let record = unsafe { &mut *self.record.as_ptr() };
+        let mut open = std::mem::take(&mut self.open);
+        while open != 0 {
+            record.guards[open.trailing_zeros() as usize] = 0;
+            open &= open - 1;
+        }
+        record.budget = 0;
+        self.granted = 0;
+    }
+    /// Grant `entries` to the blocks entered next.
+    #[inline]
+    pub fn grant(&mut self, entries: u64) {
+        let entries = entries.min(1 << 40);
+        // SAFETY: as in `open`.
+        unsafe { (*self.record.as_ptr()).budget = entries as i64 };
+        self.granted = entries;
+        self.grants += u64::from(entries != 0);
+    }
+    /// End the grant. Returns the entries the chain used and the tag of the
+    /// block it entered last, when it entered any.
+    #[inline]
+    pub fn take(&mut self) -> Option<(u64, u64)> {
+        let granted = std::mem::take(&mut self.granted);
+        self.had_grant = granted != 0;
+        if granted == 0 {
+            return None;
+        }
+        // SAFETY: as in `open`.
+        let record = unsafe { &mut *self.record.as_ptr() };
+        let left = std::mem::take(&mut record.budget).clamp(0, granted as i64) as u64;
+        (left != granted).then(|| (granted - left, record.last))
+    }
 }
 
 /// Host-only: the scans of recently entered blocks, by address. An entry
@@ -88,7 +231,7 @@ impl Default for ScanCache {
             pc: u64::MAX,
             len: 0,
             code: [0; Self::BYTES],
-            scan: Scan { entries: 0, unit: 0, last: 0, returns_through_lr: false },
+            scan: Scan { entries: 0, unit: 0, last: 0, returns_through_lr: false, plain: false, plain_return: false },
         };
         Self { entries: vec![empty; Self::SLOTS].into_boxed_slice() }
     }
@@ -260,6 +403,29 @@ pub(super) struct Scan {
     /// exception return value, that BX is an ordinary branch and the whole
     /// block may run.
     pub returns_through_lr: bool,
+    /// No instruction of the block is one the observer may have to see or
+    /// one that can change which exceptions are masked: an observer in a
+    /// settled state with an idle controller lets every entry execute, and
+    /// the state after the block is as settled as before it (`Chain`).
+    pub plain: bool,
+    /// The block would be plain but for its last instruction, a `bx lr`,
+    /// and no instruction before it can write LR: with an LR at the block's
+    /// entry that is not an exception return value, that BX is an ordinary
+    /// branch and the block behaves as a plain one.
+    pub plain_return: bool,
+}
+
+/// Whether the Thumb instruction that begins with `word` stores to memory at
+/// most once. `false` for every instruction that can store several times:
+/// PUSH and STMIA, the 32-bit store-multiple, dual and exclusive group, and
+/// the coprocessor group with VSTM, VPUSH and the 8-byte VSTR. A hooked
+/// store of such an instruction is not left inside its block (`Chain`).
+#[inline]
+pub(super) fn stores_once(word: u16) -> bool {
+    !(word & 0xfe00 == 0xb400
+        || word & 0xf800 == 0xc000
+        || word & 0xfe00 == 0xe800
+        || word & 0xee00 == 0xec00)
 }
 
 /// Scan a translated Thumb block.
@@ -268,6 +434,8 @@ pub(super) fn scan(code: &[u8]) -> Result<Scan, String> {
     // No instruction so far can write LR (`may_write_lr`).
     let mut keeps_lr = true;
     let mut returns_through_lr = false;
+    let mut plain = true;
+    let mut plain_return = false;
     while offset < code.len() {
         last = offset as u64;
         let Some(halfword) = code.get(offset..offset + 2) else {
@@ -283,6 +451,9 @@ pub(super) fn scan(code: &[u8]) -> Result<Scan, String> {
         } else {
             0
         };
+        // Only as the last instruction: anything after it clears this again.
+        plain_return = plain && word == 0x4770 && keeps_lr;
+        plain &= !(observed(word) || unmasks(word));
         if unit.is_none() {
             let exchange = word & 0xff87 == 0x4700;
             if entries != 0 && (exchange || emulated(word, second)) {
@@ -304,6 +475,8 @@ pub(super) fn scan(code: &[u8]) -> Result<Scan, String> {
         unit: unit.unwrap_or(entries),
         last,
         returns_through_lr,
+        plain,
+        plain_return,
     })
 }
 
@@ -316,6 +489,61 @@ mod tests {
     fn parts(words: &[u16]) -> (u64, u64, u64, bool) {
         let scan = scan(&code(words)).unwrap();
         (scan.entries, scan.unit, scan.last, scan.returns_through_lr)
+    }
+    #[test]
+    fn a_plain_block_has_no_instruction_the_observer_must_see() {
+        let plain = |words: &[u16]| scan(&code(words)).unwrap().plain;
+        // adds r6,#1; ldr r1,[r0]; b . ; and a 32-bit data-processing form.
+        assert!(plain(&[0x3601, 0x6801, 0xe7fe]));
+        assert!(plain(&[0xf108, 0x0801, 0xd1fc]));
+        // POP {r4,pc} loads the PC from memory; it is not an exchange.
+        assert!(plain(&[0x3601, 0xbd10]));
+        // BX and BLX, in any position: an exception return or an ordinary
+        // branch, which the observer decides.
+        assert!(!plain(&[0x3601, 0x4770]));
+        assert!(!plain(&[0x4770]));
+        // BLX writes LR and cannot be an exception return.
+        assert!(plain(&[0x4798]));
+        // SVC, WFI, MRS, an exclusive access, and the instructions that
+        // change which exceptions are masked, also as the last instruction:
+        // the block after it needs the observer.
+        assert!(!plain(&[0x3601, 0xdf00]));
+        assert!(!plain(&[0xbf30]));
+        assert!(!plain(&[0x3601, 0xf3ef, 0x8110]));
+        assert!(!plain(&[0xe854, 0x2f04, 0x3601]));
+        assert!(!plain(&[0x3601, 0xb662]));
+        assert!(!plain(&[0x3601, 0xf381, 0x8811]));
+    }
+    #[test]
+    fn only_an_instruction_with_one_store_stores_once() {
+        // str r1,[r2]; strb r1,[r2,#1]; str r0,[sp,#4]; str.w r1,[r2,#8];
+        // strh.w r1,[r2,r3]; str r1,[r2],#4.
+        for word in [0x6011, 0x7051, 0x9001, 0xf8c2, 0xf822, 0xf842] {
+            assert!(stores_once(word), "{word:#x}");
+        }
+        // push {r4,lr}; stmia r0!,{r1,r2}; stmdb sp!,{..} (push.w);
+        // stmia.w; strd (offset, pre- and post-indexed); strex; strexd;
+        // vpush; vstmia; vstr.
+        for word in [
+            0xb510, 0xb401, 0xc006, 0xe92d, 0xe880, 0xe8a0, 0xe9c0, 0xe9e0, 0xe8e0, 0xe840, 0xe8c0,
+            0xed2d, 0xec80, 0xed80, 0xfd00,
+        ] {
+            assert!(!stores_once(word), "{word:#x}");
+        }
+    }
+    #[test]
+    fn a_chain_tag_gives_back_the_pending_block() {
+        let tag = Chain::tag(0x2000_1ffe, 44, 40, 21).unwrap();
+        assert_eq!(Chain::pending(tag), (0x2000_1ffe, 44, 21, 0x2000_1ffe + 40));
+        assert_eq!(Chain::pending(Chain::tag(0, 2, 0, 1).unwrap()), (0, 2, 1, 0));
+        // Blocks that do not fit are not admitted.
+        assert_eq!(Chain::tag(0x1000, 0x1000, 0, 1), None);
+        assert_eq!(Chain::tag(0x1000, 0x800, 0x7fe, 0x100), None);
+        assert_eq!(Chain::tag(0x1000, 2, 0, 0), None);
+        assert_eq!(Chain::tag(1 << 32, 2, 0, 1), None);
+        // A key is never the closed guard value or the engine's reserved one.
+        assert_eq!(Chain::key(0), 1);
+        assert_eq!(Chain::key(0xffff_ffff), 0x10_0000);
     }
     #[test]
     fn poll_period_accepts_only_register_computation_between_a_load_and_its_branch() {

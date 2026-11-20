@@ -337,6 +337,10 @@ pub struct Board {
     /// execution are fast-forwarded. `FUJIMOD_POLL_LOOPS=0` starts a board
     /// with it off.
     poll_loops: Cell<bool>,
+    /// Host run control: M-profile processors in block execution use block
+    /// chains (`mprofile_blocks::Chain`) when the engine has them.
+    /// `FUJIMOD_BLOCK_CHAINS=0` starts a board with it off.
+    block_chains: Cell<bool>,
     /// Per core: its board store hook is installed only while it has work,
     /// and the installed hook.
     store_hooks_on_demand: Vec<Option<Option<HookId>>>,
@@ -616,6 +620,9 @@ impl Board {
             ),
             poll_loops: Cell::new(
                 std::env::var_os("FUJIMOD_POLL_LOOPS").is_none_or(|v| v != "0"),
+            ),
+            block_chains: Cell::new(
+                std::env::var_os("FUJIMOD_BLOCK_CHAINS").is_none_or(|v| v != "0"),
             ),
             store_hooks_on_demand: vec![None; n],
             store_hook_installs: Cell::new(0),
@@ -1632,6 +1639,11 @@ impl Board {
     pub fn set_poll_loops(&self, on: bool) {
         self.poll_loops.set(on);
     }
+    /// Allow or forbid block chains (`mprofile_blocks::Chain`). Both ways
+    /// give the same guest results; this exists to compare them.
+    pub fn set_block_chains(&self, on: bool) {
+        self.block_chains.set(on);
+    }
     /// Choose, before a processor runs, between the per-instruction observer
     /// and block execution (`mprofile_blocks`), and set the engine up for the
     /// choice. Block execution needs exact execution, an M-profile
@@ -1724,6 +1736,22 @@ impl Board {
             }
             cpu.invalidate_code(None)?;
         }
+        // Block chains follow block execution and their own switch. Turning
+        // them on or off changes the translations, so the engine discards
+        // them.
+        let chains = wanted && self.block_chains.get();
+        let chained = self.state.borrow().blocks[core].as_ref().unwrap().chain.is_some();
+        let mut rechained = false;
+        if chains != chained {
+            let record = self.cpus[core].block_chains(chains)?;
+            let mut s = self.state.borrow_mut();
+            let blocks = s.blocks[core].as_mut().unwrap();
+            if let Some(old) = blocks.chain.as_mut() {
+                old.close();
+            }
+            blocks.chain = record.filter(|_| chains).map(mprofile_blocks::Chain::new);
+            rechained = blocks.chain.is_some() != chained;
+        }
         // In block execution, let the store hook see only watched pages when
         // nothing needs every store of this slice: no aliased view, no
         // reservation whose granule this engine does not watch, and an
@@ -1743,7 +1771,7 @@ impl Board {
             }
         };
         let was_fast = self.state.borrow().blocks[core].as_ref().unwrap().fast_stores;
-        let mut flushed = active != wanted;
+        let mut flushed = active != wanted || rechained;
         if fast != was_fast {
             let hook = self.store_hooks[core].ok_or("M-profile store hook is missing")?;
             self.cpus[core].hook_watched(hook, fast)?;
@@ -1775,6 +1803,10 @@ impl Board {
         blocks.room = budget;
         blocks.pending = None;
         blocks.resume = false;
+        // No page is touched yet in this slice.
+        if let Some(chain) = blocks.chain.as_mut() {
+            chain.close();
+        }
         // Anything may have happened since the last run.
         blocks.poll = None;
         blocks.poll_enabled = wanted && self.poll_loops.get();
@@ -1794,6 +1826,9 @@ impl Board {
         shadow.discarded();
         shadow.begin_slice();
         s.settled.clear();
+        if let Some(chain) = s.blocks[core].as_mut().and_then(|blocks| blocks.chain.as_mut()) {
+            chain.close();
+        }
         Ok(true)
     }
     pub fn state(&self) -> Value {
@@ -1888,6 +1923,12 @@ impl Drop for Board {
                         blocks.poll_skips,
                         blocks.poll_reads
                     );
+                    if let Some(chain) = &blocks.chain {
+                        eprintln!(
+                            "FUJIMOD execution counters: CPU{core} chains grants={} chained-entries={} admissions={} stores-in-place={} observed (grant out: not plain, plain; none out: unsettled, not idle, other, after an observer): {:?}",
+                            chain.grants, chain.entries, chain.admissions, chain.in_place, chain.seen
+                        );
+                    }
                 }
             }
             for (core, skips) in s.polls.skips.iter().enumerate() {
@@ -2039,7 +2080,87 @@ impl State {
     /// Account the admitted block of a processor in block execution: all of
     /// it, or the `entered` entries of it when the engine restarted an
     /// instruction. The unentered rest returns to the run's budget.
+    /// End a block chain (`mprofile_blocks::Chain`): account the blocks the
+    /// engine entered without the observer. The block pending at the grant
+    /// and every chained block but the last ran whole; the last one becomes
+    /// the pending block. Every callback of the processor comes here, through
+    /// `settle_block` or directly, before it reads the pending block, the
+    /// clock or the entry count.
+    #[inline]
+    fn take_chain(&mut self, core: usize) -> Result<(), String> {
+        let Some(blocks) = self.blocks[core].as_mut() else {
+            return Ok(());
+        };
+        let Some((used, tag)) = blocks.chain.as_mut().and_then(|chain| chain.take()) else {
+            return Ok(());
+        };
+        let last = mprofile_blocks::Chain::pending(tag);
+        let before = blocks.pending.replace(last).map_or(0, |(_, _, entries, _)| entries);
+        let whole = (before + used)
+            .checked_sub(last.2)
+            .ok_or("block chain used less than its last block")?;
+        blocks.room = blocks
+            .room
+            .checked_sub(used)
+            .ok_or("block chain exceeded the run's entry budget")?;
+        blocks.admitted += whole;
+        if let Some(chain) = blocks.chain.as_mut() {
+            chain.entries += used;
+        }
+        self.account(core, whole)?;
+        self.instructions[core] = self.instructions[core]
+            .checked_add(whole)
+            .ok_or("instruction counter overflow")?;
+        Ok(())
+    }
+    /// Whether the observer of this processor's next block entry would be a
+    /// settled one with an idle controller, and would find nothing that
+    /// makes it stop: every test it makes before it admits a block, except
+    /// the entry budget.
+    fn observer_idle(&mut self, core: usize) -> bool {
+        self.error.is_none()
+            && self.parallel.is_none()
+            && !self.decoders.pending()
+            && self.code_run == Some(core)
+            && !self.code_shadow[core].as_ref().is_some_and(|shadow| shadow.changed())
+            && self.settled.verify == 0
+            && self.settled()
+            && self.settled.idle == Some(core)
+    }
+    /// A callback of a processor in block execution is done: its store hook
+    /// or a device access. When the observer of the next block entry would
+    /// only do bookkeeping (`observer_idle`), grant the entry budget it
+    /// would compute (`mprofile_blocks::Chain`), so that the next blocks
+    /// need no observer either. A block still pending is the one the
+    /// callback came from; its entries are debited but not yet accounted,
+    /// so the budget counts from its first entry.
+    fn grant_chain(&mut self, core: usize) -> Result<(), String> {
+        let Some(blocks) = self.blocks[core].as_ref() else {
+            return Ok(());
+        };
+        if !blocks.active || blocks.chain.is_none() || blocks.resume {
+            return Ok(());
+        }
+        let pending = blocks.pending.map_or(0, |(_, _, entries, _)| entries);
+        let room = blocks.room + pending;
+        if !self.observer_idle(core) {
+            let why = if !self.settled.armed { 2 } else if self.settled.idle != Some(core) { 3 } else { 4 };
+            if let Some(chain) = self.blocks[core].as_mut().and_then(|blocks| blocks.chain.as_mut()) {
+                chain.refused = Some(why);
+            }
+            return Ok(());
+        }
+        let until = self.clock_limit.unwrap_or(u64::MAX).min(self.settled.until);
+        let span = room
+            .min(self.timeline.processor_budget(core, u64::MAX, Some(until))?)
+            .min(self.scheduler_room(core));
+        if let Some(chain) = self.blocks[core].as_mut().and_then(|blocks| blocks.chain.as_mut()) {
+            chain.grant(span.saturating_sub(pending));
+        }
+        Ok(())
+    }
     fn settle_block(&mut self, core: usize, entered: Option<u64>) -> Result<(), String> {
+        self.take_chain(core)?;
         let Some(blocks) = self.blocks[core].as_mut() else {
             return Ok(());
         };
@@ -2054,6 +2175,13 @@ impl State {
             .checked_add(entered)
             .ok_or("instruction counter overflow")?;
         Ok(())
+    }
+    /// Whether the Thumb instruction at `pc` stores to memory at most once
+    /// (`mprofile_blocks::stores_once`).
+    fn stores_once(&self, cpu: &dyn Cpu, core: usize, pc: u64) -> Result<bool, String> {
+        let mut buffer = Vec::new();
+        let code = self.block_code(cpu, core, pc, 2, &mut buffer)?;
+        Ok(mprofile_blocks::stores_once(u16::from_le_bytes([code[0], code[1]])))
     }
     /// The Thumb code of a block, from host memory when the code shadow has
     /// the page, else through the engine.
@@ -2136,9 +2264,15 @@ impl State {
         let Self {
             code_shadow,
             mprofile,
+            blocks,
             ..
         } = self;
+        let chain = blocks[core].as_mut().and_then(|blocks| blocks.chain.as_mut());
         let Some(shadow) = code_shadow[core].as_mut() else {
+            // Without a shadow nothing is kept across a peer's slice.
+            if let Some(chain) = chain {
+                chain.open(pc);
+            }
             return Ok(false);
         };
         if shadow.changed() {
@@ -2150,7 +2284,14 @@ impl State {
         }
         let profile = &mprofile[core];
         match shadow.touch(cpu, pc & !1, |address| Self::code_page_checked(profile, address)) {
-            code_shadow::Touch::Proven => Ok(false),
+            code_shadow::Touch::Proven => {
+                // The page is touched in this slice: chained blocks of it
+                // need no touch of their own.
+                if let Some(chain) = chain {
+                    chain.open(pc);
+                }
+                Ok(false)
+            }
             code_shadow::Touch::Unchecked => {
                 shadow.entered_unchecked();
                 Ok(false)
@@ -3337,6 +3478,8 @@ unsafe fn block_restarted(data: *mut c_void, pc: u64) {
     };
     let result = (|| {
         let mut s = b.state.borrow_mut();
+        // The restarted instruction may be in a chained block.
+        s.take_chain(b.core)?;
         let Some((address, bytes, _, _)) =
             s.blocks[b.core].as_ref().and_then(|blocks| blocks.pending)
         else {
@@ -3374,6 +3517,10 @@ unsafe fn block_entered(block: fujimod_emulator_cpu::Block, data: *mut c_void) {
         let bytes = block.bytes & 0x3fff_ffff;
         // The block before this one ran whole.
         s.settle_block(core, None)?;
+        let had_grant = s.blocks[core]
+            .as_ref()
+            .and_then(|blocks| blocks.chain.as_ref())
+            .is_some_and(|chain| chain.had_grant);
         let room = s.blocks[core].as_ref().map_or(0, |blocks| blocks.room);
         if room == 0 {
             // The engine's counter stops before the observer of the first
@@ -3409,6 +3556,14 @@ unsafe fn block_entered(block: fujimod_emulator_cpu::Block, data: *mut c_void) {
             }
         };
         let (entries, last) = (scan.entries, scan.last);
+        if let Some(chain) = s.blocks[core].as_mut().and_then(|blocks| blocks.chain.as_mut()) {
+            let why = if had_grant {
+                if scan.plain_return { 6 } else { usize::from(scan.plain) }
+            } else {
+                chain.refused.take().unwrap_or(5)
+            };
+            chain.seen[why] += 1;
+        }
         // A `bx lr` that ends the admission is an ordinary branch when LR is
         // not an exception return value now and the block leaves LR alone:
         // the controller would let it execute. BX ends its block.
@@ -3423,13 +3578,17 @@ unsafe fn block_entered(block: fujimod_emulator_cpu::Block, data: *mut c_void) {
         } else {
             scan.unit
         };
+        // The entry budget of this admission, whatever the block: the run's
+        // room, the next deadline and the peer's turn.
+        let mut span = 0;
         let limit = if settled {
             // Until the next device deadline, the end of the run window, the
             // next generic-timer output change and the peer's turn.
             let until = s.clock_limit.unwrap_or(u64::MAX).min(s.settled.until);
-            unit.min(room)
+            span = room
                 .min(s.timeline.processor_budget(core, u64::MAX, Some(until))?)
-                .min(s.scheduler_room(core))
+                .min(s.scheduler_room(core));
+            unit.min(span)
         } else {
             // The pin push and deadline refresh below are not yet known to be
             // a fixed point: the next instruction needs them again.
@@ -3541,6 +3700,44 @@ unsafe fn block_entered(block: fujimod_emulator_cpu::Block, data: *mut c_void) {
         let blocks = s.blocks[core].as_mut().unwrap();
         blocks.room -= entries - 1;
         blocks.pending = Some((pc, bytes, entries, pc + last));
+        // Block chains. The observer of the next entry would be a settled
+        // one with an idle controller when this one was, and also when this
+        // one just recorded the fixed point (the settled window starts with
+        // the next entry). Verification runs want every observer entry.
+        let room = blocks.room + entries;
+        let chains = blocks.chain.is_some()
+            && s.settled.armed
+            && s.settled.idle == Some(core)
+            && s.settled.verify == 0
+            && s.parallel.is_none();
+        if chains && !settled {
+            // The entry budget from this block's first entry, as the settled
+            // observer computes it; the deadlines were just refreshed.
+            let until = s.clock_limit.unwrap_or(u64::MAX).min(s.settled.until);
+            span = room
+                .min(s.timeline.processor_budget(core, u64::MAX, Some(until))?)
+                .min(s.scheduler_room(core));
+        }
+        let why = if !s.settled.armed { 2 } else if s.settled.idle != Some(core) { 3 } else { 4 };
+        let blocks = s.blocks[core].as_mut().unwrap();
+        if let Some(chain) = blocks.chain.as_mut() {
+            // A plain block on a page touched in this slice may be entered
+            // without this observer from now on (`mprofile_blocks::Chain`).
+            if scan.plain
+                && chain.is_open(pc)
+                && let Some(tag) = mprofile_blocks::Chain::tag(pc, bytes, last, entries)
+            {
+                cpu.admit_block(entries as u32, mprofile_blocks::Chain::key(pc), tag)?;
+                chain.admissions += 1;
+            }
+            // In a settled state with an idle controller, the blocks entered
+            // next share what is left of this admission's entry budget.
+            if chains {
+                chain.grant(span.saturating_sub(entries));
+            } else {
+                chain.refused = Some(why);
+            }
+        }
         Ok::<(), String>(())
     })();
     if let Err(e) = result {
@@ -3591,37 +3788,90 @@ unsafe fn written(
             .and_then(|size| {
                 // Block execution. While the hook sees every store, a hooked
                 // store is the last instruction of its block. Once it sees
-                // only watched pages, a hooked store may be inside a block:
-                // have the engine redo it as a block of its own, and do this
-                // hook's work then. The restart accounts the entered prefix.
-                if let Some(blocks) = state.blocks[b.core].as_ref()
-                    && blocks.fast_stores
-                    && let Some((_, _, _, last)) = blocks.pending
-                    && scalar(&*cpus[b.core], Register::Pc)? & !1 != last
-                {
-                    return cpus[b.core].request_restart();
+                // only watched pages, a hooked store may be inside a block.
+                // The store may be in a chained block: end the chain first.
+                state.take_chain(b.core)?;
+                let cpu = &*cpus[b.core];
+                let inside = state.blocks[b.core]
+                    .as_ref()
+                    .filter(|blocks| blocks.fast_stores)
+                    .and_then(|blocks| blocks.pending.map(|pending| (pending, blocks.chain.is_some())));
+                let guest = address;
+                let address = cpu.translate(address, fujimod_emulator_cpu::Access::Write)?;
+                let alias = state.mprofile[b.core]
+                    .as_ref()
+                    .is_some_and(|p| p.writes_an_alias(address, size));
+                // A store inside a block normally restarts as a block of its
+                // own, so that an observer runs before it and after it. In a
+                // settled state with an idle controller both observers would
+                // only do bookkeeping, and the rest of the block was admitted
+                // with it (`mprofile_blocks::Chain`). Then the store stays
+                // where it is, unless it writes into its own block: the
+                // engine keeps executing the block it translated. The hook
+                // sees only watched pages here, which needs views without
+                // aliases, so the block's bytes have no other address.
+                // The decision must hold for the whole instruction: were an
+                // earlier store of it to stay and a later one to restart,
+                // the instruction would begin twice, and its first stores
+                // would be seen twice. So only an instruction that stores
+                // once stays, and only an aligned store, which the engine
+                // does not split.
+                // And the store must be one that reaches this hook whenever
+                // it executes. The engine also calls the hook for a store
+                // into a page nobody watches when its own state sends that
+                // store down the slow path; the restarted store then comes
+                // back on the fast path and is never seen here. Such a store
+                // keeps restarting, so that it stays unseen.
+                let mut in_place = false;
+                if let Some(((start, bytes, entries, last), chains)) = inside {
+                    let pc = scalar(cpu, Register::Pc)? & !1;
+                    let apart = guest.saturating_add(size as u64) <= start
+                        || guest >= start + u64::from(bytes);
+                    let whole = size <= 4 && guest & (size as u64 - 1) == 0;
+                    if chains
+                        && entries > 1
+                        && !alias
+                        && apart
+                        && whole
+                        && cpu.store_watched(address, size as u64)
+                        && state.observer_idle(b.core)
+                        && state.stores_once(cpu, b.core, pc)?
+                    {
+                        // The shadow's part of this hook's work first: it can
+                        // find the page changed behind the engine, and then
+                        // the next observer has work to do.
+                        if state.execution_policy == ExecutionPolicy::Exact
+                            && let Some(shadow) = state.code_shadow[b.core].as_mut()
+                        {
+                            shadow.stored(cpu, address, size);
+                        }
+                        in_place = state.observer_idle(b.core);
+                    }
+                    // Have the engine redo the store as a block of its own,
+                    // and do this hook's work then. The restart accounts the
+                    // entered prefix.
+                    if !in_place && pc != last {
+                        return cpu.request_restart();
+                    }
                 }
-                state.settle_block(b.core, None)?;
+                if !in_place {
+                    state.settle_block(b.core, None)?;
+                }
                 // A store this hook sees ends a poll loop candidate.
                 if let Some(blocks) = state.blocks[b.core].as_mut() {
                     blocks.poll = None;
                 }
                 state.polls.last[b.core] = None;
-                let address =
-                    cpus[b.core].translate(address, fujimod_emulator_cpu::Access::Write)?;
                 if state.memory.watching_writes() {
-                    write_watch::observe_store(&state, &*cpus[b.core], b.core, address, size, value);
+                    write_watch::observe_store(&state, cpu, b.core, address, size, value);
                 }
-                if state.mprofile[b.core]
-                    .as_ref()
-                    .is_some_and(|p| p.writes_an_alias(address, size))
-                {
+                if alias {
                     state.code_run = None;
                 }
                 if state.execution_policy == ExecutionPolicy::Exact
                     && let Some(shadow) = state.code_shadow[b.core].as_mut()
                 {
-                    shadow.stored(&*cpus[b.core], address, size);
+                    shadow.stored(cpu, address, size);
                 }
                 notify_memory(
                     &cpus,
@@ -3630,7 +3880,11 @@ unsafe fn written(
                     b.core,
                     address,
                     size,
-                )
+                )?;
+                if in_place && let Some(chain) = state.blocks[b.core].as_mut().and_then(|blocks| blocks.chain.as_mut()) {
+                    chain.in_place += 1;
+                }
+                state.grant_chain(b.core)
             })
     };
     if let Err(e) = result {
@@ -3651,6 +3905,9 @@ unsafe fn access(data: *mut c_void, offset: u64, size: u32, value: Option<u64>) 
         }
         let mut state = b.state.borrow_mut();
         let result = state.access(&cpus, b.core, address, size, value);
+        if result.is_ok() {
+            state.grant_chain(b.core)?;
+        }
         // Reads a poll loop fast-forward left out count as serviced.
         let skipped = std::mem::take(&mut state.polls.skipped_reads)
             + state.blocks[b.core]
