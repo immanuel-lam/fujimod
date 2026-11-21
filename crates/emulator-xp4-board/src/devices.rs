@@ -1009,6 +1009,7 @@ impl Devices {
                         columns: 16,
                         rows: 16,
                         planes: Planes::Rgb,
+                        window: None,
                     }],
                     reset_ticks: reset,
                     period_ticks: None,
